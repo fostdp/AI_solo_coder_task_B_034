@@ -1,0 +1,112 @@
+<yandex>
+    <storage_configuration>
+        <disks>
+            <hot>
+                <type>local</type>
+                <path>/var/lib/clickhouse/hot/</path>
+            </hot>
+            <warm>
+                <type>local</type>
+                <path>/var/lib/clickhouse/warm/</path>
+            </warm>
+            <cold>
+                <type>local</type>
+                <path>/var/lib/clickhouse/cold/</path>
+            </cold>
+        </disks>
+        <policies>
+            <tiered>
+                <volumes>
+                    <hot>
+                        <disk>hot</disk>
+                        <max_data_part_size>10Mi</max_data_part_size>
+                        <prefer_not_to_merge>false</prefer_not_to_merge>
+                    </hot>
+                    <warm>
+                        <disk>warm</disk>
+                        <max_data_part_size>50Mi</max_data_part_size>
+                    </warm>
+                    <cold>
+                        <disk>cold</disk>
+                    </cold>
+                </volumes>
+                <move_factor>0.1</move_factor>
+            </tiered>
+        </policies>
+    </storage_configuration>
+
+    <compression>
+        <case>
+            <min_part_size>10485760</min_part_size>
+            <min_part_size_ratio>0.01</min_part_size_ratio>
+            <method>zstd</method>
+            <level>3</level>
+        </case>
+        <case>
+            <method>lz4</method>
+        </case>
+    </compression>
+
+    <merge_tree>
+        <max_suspicious_broken_parts>10</max_suspicious_broken_parts>
+        <max_bytes_to_merge_at_max_space_in_pool>104857600000</max_bytes_to_merge_at_max_space_in_pool>
+        <parts_to_delay_insert>100</parts_to_delay_insert>
+        <parts_to_throw_insert>1000</parts_to_throw_insert>
+        <max_delay_to_insert>2</max_delay_to_insert>
+        <number_of_free_entries_in_pool_to_lower_max_size_of_merge>8</number_of_free_entries_in_pool_to_lower_max_size_of_merge>
+        <max_replicated_merges_in_queue>16</max_replicated_merges_in_queue>
+        <max_number_of_merges_with_ttl_in_pool>2</max_number_of_merges_with_ttl_in_pool>
+        <final>
+            <max_threads>4</max_threads>
+        </final>
+        <min_age_to_force_merge_seconds>86400</min_age_to_force_merge_seconds>
+    </merge_tree>
+
+    <listen_host>0.0.0.0</listen_host>
+    <http_port>8123</http_port>
+    <tcp_port>9000</tcp_port>
+
+    <logger>
+        <level>information</level>
+        <console>true</console>
+    </logger>
+
+    <profiles>
+        <default>
+            <max_memory_usage>10000000000</max_memory_usage>
+            <use_uncompressed_cache>0</use_uncompressed_cache>
+            <load_balancing>random</load_balancing>
+        </default>
+        <readonly>
+            <readonly>1</readonly>
+        </readonly>
+    </profiles>
+
+    <users>
+        <default>
+            <password></password>
+            <networks>
+                <ip>::/0</ip>
+            </networks>
+            <profile>default</profile>
+            <quota>default</quota>
+        </default>
+    </users>
+
+    <quotas>
+        <default>
+            <interval>
+                <duration>3600</duration>
+                <queries>0</queries>
+                <errors>0</errors>
+                <result_rows>0</result_rows>
+                <read_rows>0</read_rows>
+                <execution_time>0</execution_time>
+            </interval>
+        </default>
+    </quotas>
+
+    <max_concurrent_queries>100</max_concurrent_queries>
+    <max_connections>4096</max_connections>
+    <keep_alive_timeout>3</keep_alive_timeout>
+</yandex>

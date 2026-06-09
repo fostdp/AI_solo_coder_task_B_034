@@ -4,6 +4,7 @@ use chrono::{DateTime, Utc};
 use std::f64::consts::E;
 use std::sync::Arc;
 use tokio::sync::mpsc;
+use tracing::debug;
 
 const FARADAY_CONSTANT: f64 = 96485.3321;
 const MOLAR_MASS_H2: f64 = 2.01588e-3;
@@ -245,7 +246,7 @@ impl OptimizationEngineHandle {
         let mut pending = self.pending_electrolyzers.lock().unwrap();
         
         if pending.contains(&task.electrolyzer_id) {
-            log::debug!(
+            debug!(
                 "Optimization for electrolyzer {} already in queue, skipping",
                 task.electrolyzer_id
             );
@@ -266,5 +267,10 @@ impl OptimizationEngineHandle {
 
     pub fn poll_result(&mut self) -> Option<OptimizationSuggestion> {
         self.result_rx.as_mut().and_then(|rx| rx.try_recv().ok().map(|msg| msg.suggestion))
+    }
+
+    pub fn queue_depth(&self) -> usize {
+        let pending = self.pending_electrolyzers.lock().unwrap();
+        pending.len()
     }
 }

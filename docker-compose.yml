@@ -1,0 +1,143 @@
+version: '3.8'
+
+x-clickhouse-common: &clickhouse-common
+  image: clickhouse/clickhouse-server:24.8-alpine
+  ulimits:
+    nofile:
+      soft: 262144
+      hard: 262144
+  restart: unless-stopped
+
+services:
+  clickhouse:
+    <<: *clickhouse-common
+    container_name: pem-clickhouse
+    hostname: clickhouse
+    ports:
+      - "8123:8123"
+      - "9000:9000"
+    volumes:
+      - ./clickhouse/config.xml:/etc/clickhouse-server/config.d/storage_config.xml:ro
+      - ./clickhouse/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+      - clickhouse_hot:/var/lib/clickhouse/hot
+      - clickhouse_warm:/var/lib/clickhouse/warm
+      - clickhouse_cold:/var/lib/clickhouse/cold
+      - clickhouse_logs:/var/log/clickhouse-server
+    environment:
+      - TZ=Asia/Shanghai
+      - CLICKHOUSE_DB=pem_electrolyzer
+      - CLICKHOUSE_USER=default
+      - CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT=1
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8123/ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    networks:
+      - pem-network
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: pem-backend
+    hostname: backend
+    ports:
+      - "8080:8080"
+      - "34567:34567/udp"
+      - "9000:9000"
+    volumes:
+      - ./backend/config.toml:/app/config.toml:ro
+    environment:
+      - TZ=Asia/Shanghai
+      - RUST_LOG=info,pem_electrolyzer=debug
+      - APP_DATABASE__CLICKHOUSE_URL=http://clickhouse:8123
+      - APP_SERVER__API_PORT=8080
+      - APP_SERVER__PROFINET_PORT=34567
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8080/api/electrolyzers"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    networks:
+      - pem-network
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: pem-frontend
+    hostname: frontend
+    ports:
+      - "80:80"
+    environment:
+      - TZ=Asia/Shanghai
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost/"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+    networks:
+      - pem-network
+
+  simulator:
+    build:
+      context: ./simulator
+      dockerfile: Dockerfile
+    container_name: pem-simulator
+    hostname: simulator
+    ports:
+      - "8081:8081"
+    environment:
+      - TZ=Asia/Shanghai
+    command: ["--host", "backend", "--port", "34567", "--electrolyzers", "10", "--sensors", "50", "--interval", "2", "--api-port", "8081", "--initial-faults"]
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - pem-network
+
+volumes:
+  clickhouse_hot:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ./data/clickhouse/hot
+  clickhouse_warm:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ./data/clickhouse/warm
+  clickhouse_cold:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ./data/clickhouse/cold
+  clickhouse_logs:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ./data/clickhouse/logs
+
+networks:
+  pem-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16

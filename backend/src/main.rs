@@ -1,17 +1,28 @@
 use pem_electrolyzer::*;
 
 use chrono::Utc;
-use log::{error, info, warn};
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
+use tracing::{error, info, warn};
+use tracing_subscriber::{fmt, EnvFilter};
+use pem_electrolyzer::metrics as pem_metrics;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
-        .format_timestamp_millis()
+    fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| EnvFilter::new("info,pem_electrolyzer=debug")),
+        )
+        .with_target(true)
+        .with_thread_ids(true)
+        .with_file(true)
+        .with_line_number(true)
         .init();
+
+    pem_metrics::init_metrics();
 
     info!("{}", "=".repeat(60));
     info!("PEM Electrolyzer Monitoring and Efficiency Optimization Platform");
@@ -110,7 +121,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         loop {
             tokio::select! {
                 Some(batch) = data_rx.recv() => {
+                    let _timer = pem_metrics::MetricsTimer::new("main_loop_process_batch_duration_seconds");
                     let electrolyzer_id = batch.electrolyzer_id;
+
+                    pem_metrics::increment_profinet_packets_received();
+                    pem_metrics::increment_sensor_data_points();
+                    pem_metrics::set_cell_voltage(electrolyzer_id, batch.avg_voltage);
+                    pem_metrics::set_water_temp(electrolyzer_id, batch.avg_water_temp);
+                    pem_metrics::set_current_density(electrolyzer_id, batch.avg_current_density);
+                    pem_metrics::set_hydrogen_purity(electrolyzer_id, batch.avg_hydrogen_purity);
+                    pem_metrics::set_membrane_conductivity(electrolyzer_id, batch.avg_membrane_conductivity);
 
                     if let Err(e) = efficiency_analyzer.analyze_batch(&batch).await {
                         error!("Failed to analyze batch for electrolyzer {}: {}", electrolyzer_id, e);
@@ -136,7 +156,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 }
 
                 Some(result) = efficiency_rx.recv() => {
+                    let _timer = pem_metrics::MetricsTimer::new("main_loop_process_efficiency_duration_seconds");
                     let electrolyzer_id = result.electrolyzer_id;
+
+                    pem_metrics::set_efficiency(electrolyzer_id, result.efficiency);
+                    pem_metrics::set_hydrogen_production(electrolyzer_id, result.hydrogen_production);
+                    pem_metrics::set_power_consumption(electrolyzer_id, result.power_consumption);
 
                     let hydrogen_production = result.hydrogen_production * 2.0 / 3600.0;
                     let power_consumption = result.power_consumption * 2.0 / 3600.0;
@@ -184,6 +209,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     });
 
                     if result.needs_optimization {
+                        pem_metrics::increment_optimization_tasks_submitted();
                         let task = OptimizationTask {
                             electrolyzer_id,
                             current_density: result.current_density,
@@ -203,6 +229,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 }
 
                 Some(alert) = alert_rx.recv() => {
+                    let _timer = pem_metrics::MetricsTimer::new("main_loop_process_alert_duration_seconds");
+                    let level_str = match alert.alert_level {
+                        AlertLevel::Level1 => "level1",
+                        AlertLevel::Level2 => "level2",
+                        AlertLevel::Level3 => "level3",
+                    };
+                    pem_metrics::increment_alerts_generated(level_str);
+
                     {
                         let mut la = latest_alerts.write();
                         la.push(alert.clone());
@@ -229,6 +263,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         }
                     }
                 } => {
+                    pem_metrics::increment_optimization_tasks_completed(true);
+
                     {
                         let mut lo = latest_optimizations.write();
                         lo.push(suggestion.clone());
@@ -239,7 +275,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
                     let db_clone = db.clone();
                     tokio::spawn(async move {
+                        pem_metrics::increment_db_writes(true);
                         if let Err(e) = db_clone.insert_optimization_suggestion(&suggestion).await {
+                            pem_metrics::increment_db_writes(false);
                             error!("Failed to insert optimization suggestion: {}", e);
                         }
                     });
@@ -253,6 +291,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 _ = tokio::time::sleep(Duration::from_secs(1)) => {
                     let now = Utc::now();
                     if (now - last_summary_time).to_std().unwrap_or_default() >= summary_interval {
+                        pem_metrics::set_optimization_queue_depth(optimization_handle.queue_depth());
                         if let Err(e) = generate_system_summary(
                             &db,
                             &latest_status,
@@ -312,7 +351,13 @@ async fn generate_system_summary(
         active_electrolyzers: active_count,
     };
 
-    db.insert_system_summary(&summary).await?;
+    pem_metrics::set_active_electrolyzers(active_count);
+
+    pem_metrics::increment_db_writes(true);
+    if let Err(e) = db.insert_system_summary(&summary).await {
+        pem_metrics::increment_db_writes(false);
+        return Err(e.into());
+    }
 
     info!(
         "System summary: H2={:.2} m³, Efficiency={:.2}%, Power={:.2} kWh, Active={}/{}",
