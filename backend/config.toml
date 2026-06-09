@@ -1,0 +1,59 @@
+[server]
+profinet_port = 34567
+api_port = 8080
+
+[database]
+clickhouse_url = "http://localhost:8123"
+clickhouse_user = "default"
+clickhouse_password = ""
+clickhouse_database = "pem_electrolyzer"
+
+[system]
+electrolyzer_count = 10
+sensors_per_electrolyzer = 50
+active_area = 1.0
+
+[opcua]
+server_url = "opc.tcp://localhost:4840"
+heartbeat_interval_secs = 5
+heartbeat_timeout_secs = 15
+initial_reconnect_delay_ms = 1000
+max_reconnect_delay_ms = 60000
+max_reconnect_attempts = 0
+alert_queue_capacity = 1000
+
+[alerts]
+voltage_threshold = 2.0
+voltage_duration_seconds = 300
+purity_threshold = 99.9
+purity_duration_seconds = 180
+conductivity_degradation_threshold = 20.0
+
+[efficiency_model]
+a = 0.05
+b = 0.03
+r = 0.08
+exchange_current_density = 0.001
+transfer_coefficient = 0.5
+
+[optimization]
+min_current_density = 0.5
+max_current_density = 4.0
+min_temp = 40.0
+max_temp = 80.0
+efficiency_threshold = 75.0
+target_efficiency = 78.0
+max_concurrent_optimizations = 3
+queue_capacity = 100
+
+[genetic_algorithm]
+population_size = 100
+mutation_rate = 0.1
+crossover_rate = 0.8
+max_generations = 100
+elitism_count = 5
+
+[profinet]
+packet_magic = 0x50524F4E
+min_packet_size = 12
+channel_capacity = 1000

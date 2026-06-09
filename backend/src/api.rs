@@ -1,7 +1,7 @@
-use crate::alerts::AlertManager;
+use crate::alarm_bridge::AlarmBridge;
 use crate::db::Database;
+use crate::efficiency_analyzer::EfficiencyAnalyzer;
 use crate::models::*;
-use crate::optimization::OptimizationService;
 use axum::{
     extract::{Path, Query},
     http::StatusCode,
@@ -20,8 +20,8 @@ use uuid::Uuid;
 #[derive(Clone)]
 pub struct AppState {
     pub db: Database,
-    pub alert_manager: AlertManager,
-    pub optimization_service: OptimizationService,
+    pub alarm_bridge: Arc<AlarmBridge>,
+    pub efficiency_analyzer: EfficiencyAnalyzer,
     pub latest_status: Arc<RwLock<HashMap<u8, ElectrolyzerStatus>>>,
     pub latest_sensors: Arc<RwLock<HashMap<u8, Vec<SensorData>>>>,
     pub latest_alerts: Arc<RwLock<Vec<Alert>>>,
@@ -158,7 +158,7 @@ async fn get_electrolyzer_list(
             };
 
         let alerts = state
-            .alert_manager
+            .alarm_bridge
             .get_alert_state(id)
             .map(|_| Vec::new())
             .unwrap_or_default();
@@ -389,7 +389,7 @@ async fn acknowledge_alert(
     Query(params): Query<AlertActionQuery>,
     state: axum::extract::State<AppState>,
 ) -> impl IntoResponse {
-    match state.alert_manager.acknowledge_alert(params.alert_id).await {
+    match state.alarm_bridge.acknowledge_alert(params.alert_id).await {
         Ok(_) => Json(ApiResponse::success(true)),
         Err(e) => (Json(ApiResponse::<bool>::error(&e))),
     }
@@ -399,7 +399,7 @@ async fn resolve_alert(
     Query(params): Query<AlertActionQuery>,
     state: axum::extract::State<AppState>,
 ) -> impl IntoResponse {
-    match state.alert_manager.resolve_alert(params.alert_id).await {
+    match state.alarm_bridge.resolve_alert(params.alert_id).await {
         Ok(_) => Json(ApiResponse::success(true)),
         Err(e) => (Json(ApiResponse::<bool>::error(&e))),
     }
@@ -426,11 +426,11 @@ async fn get_efficiency_curves(
         .unwrap_or(60.0);
 
     let efficiency_curve = state
-        .optimization_service
+        .efficiency_analyzer
         .get_efficiency_curve(0.5..4.0, 50, current_temp);
 
     let polarization_curve = state
-        .optimization_service
+        .efficiency_analyzer
         .get_polarization_curve(0.5..4.0, 50, current_temp);
 
     Json(ApiResponse::success(serde_json::json!({

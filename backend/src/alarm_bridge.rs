@@ -1,3 +1,4 @@
+use crate::config::{AlertConfig, OpcUaConfig};
 use crate::db::Database;
 use crate::models::*;
 use chrono::{DateTime, Duration, Utc};
@@ -10,48 +11,6 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
-const VOLTAGE_THRESHOLD: f64 = 2.0;
-const VOLTAGE_DURATION_SECONDS: i64 = 300;
-
-const PURITY_THRESHOLD: f64 = 99.9;
-const PURITY_DURATION_SECONDS: i64 = 180;
-
-const CONDUCTIVITY_DEGRADATION_THRESHOLD: f64 = 20.0;
-
-#[derive(Debug, Clone)]
-struct AlertConditionState {
-    start_time: Option<DateTime<Utc>>,
-    current_value: f64,
-    triggered: bool,
-    baseline_conductivity: Option<f64>,
-    last_alert_id: Option<Uuid>,
-}
-
-impl Default for AlertConditionState {
-    fn default() -> Self {
-        Self {
-            start_time: None,
-            current_value: 0.0,
-            triggered: false,
-            baseline_conductivity: None,
-            last_alert_id: None,
-        }
-    }
-}
-
-pub struct AlertManager {
-    db: Database,
-    states: Arc<RwLock<HashMap<u8, AlertState>>>,
-    opcua_client: Option<OpcUaClient>,
-}
-
-#[derive(Debug, Clone, Default)]
-struct AlertState {
-    voltage: AlertConditionState,
-    purity: AlertConditionState,
-    conductivity: AlertConditionState,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ConnectionState {
     Disconnected,
@@ -61,44 +20,32 @@ enum ConnectionState {
 }
 
 struct OpcUaClient {
-    server_url: String,
+    config: OpcUaConfig,
     connection_state: Arc<RwLock<ConnectionState>>,
     alert_tx: mpsc::Sender<Alert>,
     heartbeat_task: Option<JoinHandle<()>>,
     reconnect_task: Option<JoinHandle<()>>,
     last_heartbeat: Arc<RwLock<Instant>>,
     reconnect_attempts: Arc<RwLock<u32>>,
-    max_reconnect_delay_ms: u64,
-    max_reconnect_attempts: u32,
-    alert_queue_capacity: usize,
 }
 
-const HEARTBEAT_INTERVAL_SECS: u64 = 5;
-const HEARTBEAT_TIMEOUT_SECS: u64 = 15;
-const INITIAL_RECONNECT_DELAY_MS: u64 = 1000;
-const MAX_RECONNECT_DELAY_MS: u64 = 60000;
-const MAX_RECONNECT_ATTEMPTS: u32 = 0;
-
 impl OpcUaClient {
-    fn new(server_url: &str) -> Self {
-        let (alert_tx, _alert_rx) = mpsc::channel::<Alert>(1000);
+    fn new(config: OpcUaConfig) -> Self {
+        let (alert_tx, _alert_rx) = mpsc::channel::<Alert>(config.alert_queue_capacity);
         
         Self {
-            server_url: server_url.to_string(),
+            config,
             connection_state: Arc::new(RwLock::new(ConnectionState::Disconnected)),
             alert_tx,
             heartbeat_task: None,
             reconnect_task: None,
             last_heartbeat: Arc::new(RwLock::new(Instant::now())),
             reconnect_attempts: Arc::new(RwLock::new(0)),
-            max_reconnect_delay_ms: MAX_RECONNECT_DELAY_MS,
-            max_reconnect_attempts: MAX_RECONNECT_ATTEMPTS,
-            alert_queue_capacity: 1000,
         }
     }
 
     async fn connect(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        info!("Connecting to OPC UA server at {}", self.server_url);
+        info!("Connecting to OPC UA server at {}", self.config.server_url);
         
         *self.connection_state.write() = ConnectionState::Connecting;
         
@@ -122,7 +69,7 @@ impl OpcUaClient {
     }
 
     async fn attempt_connection(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        debug!("Attempting OPC UA connection to {}", self.server_url);
+        debug!("Attempting OPC UA connection to {}", self.config.server_url);
         
         #[cfg(feature = "opcua")]
         {
@@ -135,7 +82,7 @@ impl OpcUaClient {
             
             let _session = client
                 .connect_to_endpoint(
-                    self.server_url.as_str(),
+                    self.config.server_url.as_str(),
                     opcua::client::IdentityToken::Anonymous,
                 )
                 .await
@@ -153,13 +100,14 @@ impl OpcUaClient {
     fn start_heartbeat_task(&mut self) {
         let connection_state = self.connection_state.clone();
         let last_heartbeat = self.last_heartbeat.clone();
-        let server_url = self.server_url.clone();
+        let config = self.config.clone();
+        let server_url = self.config.server_url.clone();
         
         let handle = tokio::spawn(async move {
             info!("OPC UA heartbeat task started");
             
             loop {
-                tokio::time::sleep(StdDuration::from_secs(HEARTBEAT_INTERVAL_SECS)).await;
+                tokio::time::sleep(StdDuration::from_secs(config.heartbeat_interval_secs)).await;
                 
                 let state = *connection_state.read();
                 if state != ConnectionState::Connected {
@@ -168,7 +116,7 @@ impl OpcUaClient {
                 }
                 
                 let elapsed = last_heartbeat.read().elapsed();
-                if elapsed.as_secs() > HEARTBEAT_TIMEOUT_SECS {
+                if elapsed.as_secs() > config.heartbeat_timeout_secs {
                     warn!(
                         "OPC UA heartbeat timeout: no response for {}s, connection may be lost",
                         elapsed.as_secs()
@@ -195,9 +143,8 @@ impl OpcUaClient {
         
         let connection_state = self.connection_state.clone();
         let reconnect_attempts = self.reconnect_attempts.clone();
-        let server_url = self.server_url.clone();
-        let max_delay_ms = self.max_reconnect_delay_ms;
-        let max_attempts = self.max_reconnect_attempts;
+        let server_url = self.config.server_url.clone();
+        let config = self.config.clone();
         let last_heartbeat = self.last_heartbeat.clone();
         
         let handle = tokio::spawn(async move {
@@ -213,13 +160,13 @@ impl OpcUaClient {
                     break;
                 }
                 
-                if max_attempts > 0 && attempt >= max_attempts {
-                    error!("Max reconnect attempts ({}) reached, giving up", max_attempts);
+                if config.max_reconnect_attempts > 0 && attempt >= config.max_reconnect_attempts {
+                    error!("Max reconnect attempts ({}) reached, giving up", config.max_reconnect_attempts);
                     *connection_state.write() = ConnectionState::Disconnected;
                     break;
                 }
                 
-                let delay_ms = calculate_exponential_backoff(attempt, INITIAL_RECONNECT_DELAY_MS, max_delay_ms);
+                let delay_ms = calculate_exponential_backoff(attempt, config.initial_reconnect_delay_ms, config.max_reconnect_delay_ms);
                 
                 info!(
                     "Reconnect attempt {} in {}ms",
@@ -332,43 +279,90 @@ impl OpcUaClient {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
-pub struct OpcUaConnectionStatus {
-    pub connected: bool,
-    pub state: String,
-    pub reconnect_attempts: u32,
-    pub last_heartbeat_seconds: u64,
-}
-
 fn calculate_exponential_backoff(attempt: u32, initial_delay_ms: u64, max_delay_ms: u64) -> u64 {
     let delay = initial_delay_ms * 2u64.pow(attempt.min(10));
     delay.min(max_delay_ms)
 }
 
-impl AlertManager {
-    pub fn new(db: Database, opcua_server_url: Option<&str>) -> Self {
-        let opcua_client = opcua_server_url.map(OpcUaClient::new);
+#[derive(Debug, Clone, Copy)]
+struct AlertConditionState {
+    start_time: Option<DateTime<Utc>>,
+    current_value: f64,
+    triggered: bool,
+    baseline_conductivity: Option<f64>,
+    last_alert_id: Option<Uuid>,
+}
 
+impl Default for AlertConditionState {
+    fn default() -> Self {
         Self {
-            db,
-            states: Arc::new(RwLock::new(HashMap::new())),
-            opcua_client,
+            start_time: None,
+            current_value: 0.0,
+            triggered: false,
+            baseline_conductivity: None,
+            last_alert_id: None,
         }
     }
+}
 
-    pub async fn process_data(
+#[derive(Debug, Clone, Default, Copy)]
+struct AlertState {
+    voltage: AlertConditionState,
+    purity: AlertConditionState,
+    conductivity: AlertConditionState,
+}
+
+#[derive(Debug, Clone)]
+pub struct AlarmBridge {
+    db: Database,
+    alert_config: AlertConfig,
+    states: Arc<RwLock<HashMap<u8, AlertState>>>,
+    opcua_client: Option<OpcUaClient>,
+    alert_tx: mpsc::Sender<Alert>,
+}
+
+impl AlarmBridge {
+    pub fn new(
+        db: Database,
+        alert_config: AlertConfig,
+        opcua_config: Option<OpcUaConfig>,
+    ) -> (Self, mpsc::Receiver<Alert>) {
+        let (alert_tx, alert_rx) = mpsc::channel::<Alert>(1000);
+        
+        let opcua_client = opcua_config.map(OpcUaClient::new);
+
+        (
+            Self {
+                db,
+                alert_config,
+                states: Arc::new(RwLock::new(HashMap::new())),
+                opcua_client,
+                alert_tx,
+            },
+            alert_rx,
+        )
+    }
+
+    pub async fn connect_opcua(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if let Some(ref mut client) = self.opcua_client {
+            client.connect().await?;
+        }
+        Ok(())
+    }
+
+    pub async fn process_sensor_data(
         &self,
         electrolyzer_id: u8,
-        cell_voltage: f64,
+        max_cell_voltage: f64,
         avg_cell_voltage: f64,
         hydrogen_purity: f64,
         membrane_conductivity: f64,
         timestamp: DateTime<Utc>,
-    ) -> Vec<Alert> {
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let mut alerts = Vec::new();
 
         if let Some(alert) = self
-            .check_voltage_alert(electrolyzer_id, cell_voltage, avg_cell_voltage, timestamp)
+            .check_voltage_alert(electrolyzer_id, max_cell_voltage, avg_cell_voltage, timestamp)
             .await
         {
             alerts.push(alert);
@@ -388,7 +382,18 @@ impl AlertManager {
             alerts.push(alert);
         }
 
-        alerts
+        for alert in &alerts {
+            if let Err(e) = self.alert_tx.send(alert.clone()).await {
+                error!("Failed to send alert to channel: {}", e);
+            }
+        }
+
+        Ok(())
+    }
+
+    pub async fn process_alert(&self, alert: &Alert) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.handle_alert(alert).await;
+        Ok(())
     }
 
     async fn check_voltage_alert(
@@ -407,19 +412,19 @@ impl AlertManager {
 
         state.voltage.current_value = max_voltage;
 
-        if max_voltage > VOLTAGE_THRESHOLD {
+        if max_voltage > self.alert_config.voltage_threshold {
             if state.voltage.start_time.is_none() {
                 state.voltage.start_time = Some(timestamp);
                 info!(
                     "Electrolyzer {} voltage {:.3}V exceeds threshold {:.3}V, starting timer",
-                    electrolyzer_id, max_voltage, VOLTAGE_THRESHOLD
+                    electrolyzer_id, max_voltage, self.alert_config.voltage_threshold
                 );
             }
 
             if !state.voltage.triggered {
                 if let Some(start_time) = state.voltage.start_time {
                     let duration = timestamp - start_time;
-                    if duration.num_seconds() >= VOLTAGE_DURATION_SECONDS {
+                    if duration.num_seconds() >= self.alert_config.voltage_duration_seconds {
                         let alert = Alert {
                             id: Uuid::new_v4(),
                             timestamp,
@@ -427,11 +432,11 @@ impl AlertManager {
                             alert_level: AlertLevel::Level1,
                             alert_type: "high_voltage".to_string(),
                             message: format!(
-                                "Electrolyzer {} voltage exceeded {:.3}V for more than 5 minutes",
-                                electrolyzer_id, VOLTAGE_THRESHOLD
+                                "Electrolyzer {} voltage exceeded {:.3}V for more than {} seconds",
+                                electrolyzer_id, self.alert_config.voltage_threshold, self.alert_config.voltage_duration_seconds
                             ),
                             value: max_voltage,
-                            threshold: VOLTAGE_THRESHOLD,
+                            threshold: self.alert_config.voltage_threshold,
                             acknowledged: false,
                             resolved: false,
                         };
@@ -439,7 +444,6 @@ impl AlertManager {
                         state.voltage.triggered = true;
                         state.voltage.last_alert_id = Some(alert.id);
 
-                        self.handle_alert(&alert).await;
                         return Some(alert);
                     }
                 }
@@ -471,19 +475,19 @@ impl AlertManager {
 
         state.purity.current_value = hydrogen_purity;
 
-        if hydrogen_purity < PURITY_THRESHOLD {
+        if hydrogen_purity < self.alert_config.purity_threshold {
             if state.purity.start_time.is_none() {
                 state.purity.start_time = Some(timestamp);
                 info!(
                     "Electrolyzer {} hydrogen purity {:.3}% below threshold {:.3}%, starting timer",
-                    electrolyzer_id, hydrogen_purity, PURITY_THRESHOLD
+                    electrolyzer_id, hydrogen_purity, self.alert_config.purity_threshold
                 );
             }
 
             if !state.purity.triggered {
                 if let Some(start_time) = state.purity.start_time {
                     let duration = timestamp - start_time;
-                    if duration.num_seconds() >= PURITY_DURATION_SECONDS {
+                    if duration.num_seconds() >= self.alert_config.purity_duration_seconds {
                         let alert = Alert {
                             id: Uuid::new_v4(),
                             timestamp,
@@ -491,11 +495,11 @@ impl AlertManager {
                             alert_level: AlertLevel::Level2,
                             alert_type: "low_hydrogen_purity".to_string(),
                             message: format!(
-                                "Electrolyzer {} hydrogen purity dropped below {:.3}% for more than 3 minutes",
-                                electrolyzer_id, PURITY_THRESHOLD
+                                "Electrolyzer {} hydrogen purity dropped below {:.3}% for more than {} seconds",
+                                electrolyzer_id, self.alert_config.purity_threshold, self.alert_config.purity_duration_seconds
                             ),
                             value: hydrogen_purity,
-                            threshold: PURITY_THRESHOLD,
+                            threshold: self.alert_config.purity_threshold,
                             acknowledged: false,
                             resolved: false,
                         };
@@ -503,7 +507,6 @@ impl AlertManager {
                         state.purity.triggered = true;
                         state.purity.last_alert_id = Some(alert.id);
 
-                        self.handle_alert(&alert).await;
                         return Some(alert);
                     }
                 }
@@ -547,7 +550,7 @@ impl AlertManager {
         if let Some(baseline) = state.conductivity.baseline_conductivity {
             let degradation_percent = ((baseline - membrane_conductivity) / baseline) * 100.0;
 
-            if degradation_percent > CONDUCTIVITY_DEGRADATION_THRESHOLD && !state.conductivity.triggered
+            if degradation_percent > self.alert_config.conductivity_degradation_threshold && !state.conductivity.triggered
             {
                 let alert = Alert {
                     id: Uuid::new_v4(),
@@ -560,7 +563,7 @@ impl AlertManager {
                         electrolyzer_id, degradation_percent
                     ),
                     value: membrane_conductivity,
-                    threshold: baseline * (1.0 - CONDUCTIVITY_DEGRADATION_THRESHOLD / 100.0),
+                    threshold: baseline * (1.0 - self.alert_config.conductivity_degradation_threshold / 100.0),
                     acknowledged: false,
                     resolved: false,
                 };
@@ -568,7 +571,6 @@ impl AlertManager {
                 state.conductivity.triggered = true;
                 state.conductivity.last_alert_id = Some(alert.id);
 
-                self.handle_alert(&alert).await;
                 return Some(alert);
             }
         }
@@ -644,9 +646,21 @@ impl AlertManager {
             );
         }
     }
+
+    pub fn get_opcua_status(&self) -> Option<OpcUaConnectionStatus> {
+        self.opcua_client.as_ref().map(|c| c.get_connection_status())
+    }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct OpcUaConnectionStatus {
+    pub connected: bool,
+    pub state: String,
+    pub reconnect_attempts: u32,
+    pub last_heartbeat_seconds: u64,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct AlertStateSummary {
     pub voltage_exceeded: bool,
     pub voltage_duration: Option<i64>,
@@ -655,40 +669,4 @@ pub struct AlertStateSummary {
     pub conductivity_degraded: bool,
     pub baseline_conductivity: Option<f64>,
     pub current_conductivity: f64,
-}
-
-#[derive(Debug, Clone)]
-pub struct AlertConfig {
-    pub voltage_threshold: f64,
-    pub voltage_duration: Duration,
-    pub purity_threshold: f64,
-    pub purity_duration: Duration,
-    pub conductivity_degradation_threshold: f64,
-}
-
-impl Default for AlertConfig {
-    fn default() -> Self {
-        Self {
-            voltage_threshold: VOLTAGE_THRESHOLD,
-            voltage_duration: Duration::seconds(VOLTAGE_DURATION_SECONDS),
-            purity_threshold: PURITY_THRESHOLD,
-            purity_duration: Duration::seconds(PURITY_DURATION_SECONDS),
-            conductivity_degradation_threshold: CONDUCTIVITY_DEGRADATION_THRESHOLD,
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_alert_config_defaults() {
-        let config = AlertConfig::default();
-        assert_eq!(config.voltage_threshold, 2.0);
-        assert_eq!(config.voltage_duration.num_seconds(), 300);
-        assert_eq!(config.purity_threshold, 99.9);
-        assert_eq!(config.purity_duration.num_seconds(), 180);
-        assert_eq!(config.conductivity_degradation_threshold, 20.0);
-    }
 }

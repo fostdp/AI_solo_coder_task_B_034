@@ -1,6 +1,7 @@
+use crate::config::ProfinetConfig;
 use crate::db::Database;
 use crate::models::*;
-use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
+use byteorder::{BigEndian, ReadBytesExt};
 use chrono::{DateTime, TimeZone, Utc};
 use crc::{Crc, CRC_32_ISCSI};
 use std::collections::HashMap;
@@ -13,14 +14,6 @@ use tokio::sync::mpsc;
 pub const PROFINET_CRC: Crc<u32> = Crc::<u32>::new(&CRC_32_ISCSI);
 const PACKET_HEADER_SIZE: usize = 8;
 const CRC_SIZE: usize = 4;
-const MIN_PACKET_SIZE: usize = PACKET_HEADER_SIZE + CRC_SIZE;
-
-#[derive(Debug, Clone)]
-pub struct ProfinetReceiver {
-    port: u16,
-    db: Database,
-    data_tx: mpsc::Sender<SensorDataBatch>,
-}
 
 #[derive(Debug, Clone)]
 pub struct SensorDataBatch {
@@ -36,12 +29,22 @@ pub struct SensorDataBatch {
     pub cell_voltages: Vec<f64>,
 }
 
-impl ProfinetReceiver {
-    pub fn new(port: u16, db: Database) -> (Self, mpsc::Receiver<SensorDataBatch>) {
-        let (data_tx, data_rx) = mpsc::channel(1000);
+#[derive(Debug, Clone)]
+pub struct ProfinetDriver {
+    config: ProfinetConfig,
+    db: Database,
+    data_tx: mpsc::Sender<SensorDataBatch>,
+}
+
+impl ProfinetDriver {
+    pub fn new(
+        config: ProfinetConfig,
+        db: Database,
+    ) -> (Self, mpsc::Receiver<SensorDataBatch>) {
+        let (data_tx, data_rx) = mpsc::channel(config.channel_capacity);
         (
             Self {
-                port,
+                config,
                 db,
                 data_tx,
             },
@@ -49,10 +52,10 @@ impl ProfinetReceiver {
         )
     }
 
-    pub async fn run(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let addr = format!("0.0.0.0:{}", self.port);
+    pub async fn run(&self, port: u16) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let addr = format!("0.0.0.0:{}", port);
         let socket = Arc::new(UdpSocket::bind(&addr).await?);
-        log::info!("Profinet receiver listening on {}", addr);
+        log::info!("Profinet driver listening on {}", addr);
 
         let mut buf = vec![0u8; 65535];
         let mut invalid_packet_count = 0u64;
@@ -61,12 +64,12 @@ impl ProfinetReceiver {
         loop {
             let (len, src) = socket.recv_from(&mut buf).await?;
             
-            if len < MIN_PACKET_SIZE {
+            if len < self.config.min_packet_size {
                 invalid_packet_count += 1;
                 if last_invalid_log.elapsed().as_secs() >= 60 {
                     log::warn!(
                         "Profinet packet too short from {}: {} bytes (min {}), total invalid: {}",
-                        src, len, MIN_PACKET_SIZE, invalid_packet_count
+                        src, len, self.config.min_packet_size, invalid_packet_count
                     );
                     last_invalid_log = Instant::now();
                 }
@@ -122,10 +125,10 @@ impl ProfinetReceiver {
         
         let magic = cursor.read_u32::<BigEndian>()?;
         
-        if magic != 0x50524F4E {
+        if magic != self.config.packet_magic {
             return Err(format!(
-                "Invalid magic number: 0x{:08X}, expected: 0x50524F4E (PRON)",
-                magic
+                "Invalid magic number: 0x{:08X}, expected: 0x{:08X} (PRON)",
+                magic, self.config.packet_magic
             )
             .into());
         }
@@ -185,6 +188,14 @@ impl ProfinetReceiver {
             .single()
             .unwrap_or_else(|| Utc::now());
 
+        self.clean_and_aggregate_sensors(packet, timestamp)
+    }
+
+    fn clean_and_aggregate_sensors(
+        &self,
+        packet: ProfinetPacket,
+        timestamp: DateTime<Utc>,
+    ) -> Result<SensorDataBatch, Box<dyn std::error::Error + Send + Sync>> {
         let mut voltage_sum = 0.0;
         let mut current_density_sum = 0.0;
         let mut hydrogen_flow_sum = 0.0;
@@ -198,7 +209,7 @@ impl ProfinetReceiver {
         let mut h2_count = 0;
         let mut temp_count = 0;
         let mut purity_count = 0;
-        let cond_count = &mut 0;
+        let mut cond_count = 0;
 
         let mut sensor_data_map: HashMap<u16, SensorData> = HashMap::new();
 
@@ -221,6 +232,14 @@ impl ProfinetReceiver {
                 "membrane" => Location::Membrane,
                 _ => continue,
             };
+
+            if !Self::validate_sensor_value(sensor_type, reading.value) {
+                log::warn!(
+                    "Sensor value out of valid range: sensor_id={}, type={:?}, value={}",
+                    reading.sensor_id, sensor_type, reading.value
+                );
+                continue;
+            }
 
             match sensor_type {
                 SensorType::Voltage | SensorType::CellVoltage => {
@@ -248,7 +267,7 @@ impl ProfinetReceiver {
                 }
                 SensorType::MembraneConductivity => {
                     membrane_conductivity_sum += reading.value;
-                    *cond_count += 1;
+                    cond_count += 1;
                 }
                 _ => {}
             }
@@ -296,8 +315,8 @@ impl ProfinetReceiver {
         } else {
             0.0
         };
-        let avg_membrane_conductivity = if *cond_count > 0 {
-            membrane_conductivity_sum / *cond_count as f64
+        let avg_membrane_conductivity = if cond_count > 0 {
+            membrane_conductivity_sum / cond_count as f64
         } else {
             0.0
         };
@@ -318,5 +337,17 @@ impl ProfinetReceiver {
             avg_membrane_conductivity,
             cell_voltages,
         })
+    }
+
+    fn validate_sensor_value(sensor_type: SensorType, value: f64) -> bool {
+        match sensor_type {
+            SensorType::Voltage | SensorType::CellVoltage => value > 0.0 && value < 5.0,
+            SensorType::CurrentDensity => value >= 0.0 && value <= 10.0,
+            SensorType::HydrogenFlow | SensorType::OxygenFlow => value >= 0.0 && value < 1000.0,
+            SensorType::WaterTemp => value >= 0.0 && value <= 100.0,
+            SensorType::MembraneConductivity => value > 0.0 && value < 1.0,
+            SensorType::HydrogenPurity => value >= 0.0 && value <= 100.0,
+            _ => value.is_finite(),
+        }
     }
 }

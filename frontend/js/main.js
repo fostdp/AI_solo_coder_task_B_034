@@ -2,7 +2,7 @@ class App {
     constructor() {
         this.currentElectrolyzerId = null;
         this.currentSensorId = null;
-        this.electrolyzerCanvas = null;
+        this.stackProfile = null;
         this.trendChart = null;
         this.efficiencyChart = null;
         this.modalTrendChart = null;
@@ -187,10 +187,10 @@ class App {
         document.getElementById('detail-section').style.display = 'block';
         document.getElementById('detail-title').textContent = `电解槽 #${id} 详细信息`;
         
-        if (!this.electrolyzerCanvas) {
-            this.electrolyzerCanvas = new ElectrolyzerCanvas('electrolyzer-canvas');
-            this.electrolyzerCanvas.onSensorClick = (sensor) => this.showSensorDetail(sensor);
-            this.electrolyzerCanvas.onSensorHover = (sensor) => this.updateSensorInfoPanel(sensor);
+        if (!this.stackProfile) {
+            this.stackProfile = new StackProfile('electrolyzer-canvas');
+            this.stackProfile.onSensorClick = (sensor) => this.showSensorDetail(sensor);
+            this.stackProfile.onSensorHover = (sensor) => this.updateSensorInfoPanel(sensor);
         }
         
         if (!this.trendChart) {
@@ -224,7 +224,7 @@ class App {
     }
 
     updateElectrolyzerDetail(detail) {
-        this.electrolyzerCanvas.setData(detail);
+        this.stackProfile.setData(detail);
         
         document.getElementById('status-current').textContent = detail.current_density?.toFixed(2) || '--';
         document.getElementById('status-temp').textContent = detail.water_temp?.toFixed(1) || '--';
