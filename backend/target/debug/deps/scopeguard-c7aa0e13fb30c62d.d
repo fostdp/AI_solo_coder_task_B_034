@@ -1,0 +1,7 @@
+D:\SOLO-2\AI_solo_coder_task_B_034\backend\target\debug\deps\scopeguard-c7aa0e13fb30c62d.d: C:\Users\y\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\scopeguard-1.2.0\src\lib.rs
+
+D:\SOLO-2\AI_solo_coder_task_B_034\backend\target\debug\deps\libscopeguard-c7aa0e13fb30c62d.rlib: C:\Users\y\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\scopeguard-1.2.0\src\lib.rs
+
+D:\SOLO-2\AI_solo_coder_task_B_034\backend\target\debug\deps\libscopeguard-c7aa0e13fb30c62d.rmeta: C:\Users\y\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\scopeguard-1.2.0\src\lib.rs
+
+C:\Users\y\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\scopeguard-1.2.0\src\lib.rs:

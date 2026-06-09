@@ -2,7 +2,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum SensorType {
     Voltage,
@@ -13,14 +13,49 @@ pub enum SensorType {
     MembraneConductivity,
     HydrogenPurity,
     CellVoltage,
+    UltrasonicSensor,
+    AcousticEmission,
+    SolarIrradiance,
+    WindSpeed,
+    RenewablePower,
+    StepResponseVoltage,
+    HighFreqImpedance,
+    LowFreqImpedance,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum Location {
     Anode,
     Cathode,
     Membrane,
+    InletManifold,
+    OutletManifold,
+    SealingGasket,
+    EndPlate,
+    BusBar,
+    CoolingChannel,
+    GasDiffusionLayer,
+    CatalystLayer,
+    MembraneElectrodeAssembly,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum DegradationMode {
+    MembraneDryout,
+    CatalystPoisoning,
+    ContactResistanceIncrease,
+    Normal,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum DegradationSeverity {
+    Low,
+    Medium,
+    High,
+    Critical,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -197,4 +232,195 @@ pub struct OptimizationResult {
     pub expected_efficiency: f64,
     pub generations: u32,
     pub fitness: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EISDataPoint {
+    pub frequency: f64,
+    pub real_impedance: f64,
+    pub imag_impedance: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EquivalentCircuitParams {
+    pub ohmic_resistance: f64,
+    pub charge_transfer_resistance: f64,
+    pub double_layer_capacitance: f64,
+    pub warburg_coefficient: f64,
+    pub fit_error: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StepResponseData {
+    pub time_points: Vec<f64>,
+    pub voltage_points: Vec<f64>,
+    pub current_step: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiagnosticIcon {
+    pub x: f64,
+    pub y: f64,
+    pub degradation_mode: DegradationMode,
+    pub severity: DegradationSeverity,
+    pub confidence: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MEADiagnosticResult {
+    pub electrolyzer_id: u8,
+    pub timestamp: DateTime<Utc>,
+    pub equivalent_circuit: EquivalentCircuitParams,
+    pub degradation_mode: DegradationMode,
+    pub severity: DegradationSeverity,
+    pub confidence: f64,
+    pub membrane_conductivity_trend: f64,
+    pub step_response_overshoot: f64,
+    pub step_response_settling_time: f64,
+    pub recommendations: Vec<String>,
+    pub icons: Vec<DiagnosticIcon>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AcousticEmissionData {
+    pub sensor_id: u16,
+    pub timestamp: DateTime<Utc>,
+    pub signal: Vec<f64>,
+    pub sampling_rate: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpectralFeatures {
+    pub rms: f64,
+    pub peak_frequency: f64,
+    pub spectral_centroid: f64,
+    pub kurtosis: f64,
+    pub peak_amplitude: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LeakLocation {
+    pub x: f64,
+    pub y: f64,
+    pub z: f64,
+    pub uncertainty: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HydrogenLeak {
+    pub id: Uuid,
+    pub electrolyzer_id: u8,
+    pub timestamp: DateTime<Utc>,
+    pub location: LeakLocation,
+    pub leak_rate: f64,
+    pub diffusion_radius: f64,
+    pub severity: DegradationSeverity,
+    pub spectral_features: SpectralFeatures,
+    pub acknowledged: bool,
+    pub resolved: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LeakAnimation {
+    pub leak_id: Uuid,
+    pub x: f64,
+    pub y: f64,
+    pub max_radius: f64,
+    pub leak_rate: f64,
+    pub severity: DegradationSeverity,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RenewablePowerData {
+    pub timestamp: DateTime<Utc>,
+    pub solar_power: f64,
+    pub wind_power: f64,
+    pub total_power: f64,
+    pub grid_power: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MPCState {
+    pub timestamp: DateTime<Utc>,
+    pub electrolyzer_id: u8,
+    pub target_power: f64,
+    pub actual_power: f64,
+    pub current_density: f64,
+    pub tracking_error: f64,
+    pub control_signal: f64,
+    pub start_stop_count: u32,
+    pub operating_hours: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RenewableCouplingStatus {
+    pub electrolyzer_id: u8,
+    pub timestamp: DateTime<Utc>,
+    pub renewable_utilization: f64,
+    pub grid_supplementation: f64,
+    pub tracking_accuracy: f64,
+    pub start_stop_count: u32,
+    pub is_tracking: bool,
+    pub predicted_power: Vec<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VoltageCurrentPoint {
+    pub timestamp: DateTime<Utc>,
+    pub current_density: f64,
+    pub cell_voltage: f64,
+    pub efficiency: f64,
+    pub temperature: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DegradationFeature {
+    pub voltage_increase_rate: f64,
+    pub efficiency_decay_rate: f64,
+    pub resistance_increase_rate: f64,
+    pub performance_index: f64,
+    pub cumulative_operating_hours: f64,
+    pub total_charge: f64,
+    pub temperature_cycling_count: u32,
+    pub max_power_pct: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GPPredictionPoint {
+    pub days_ahead: u32,
+    pub predicted_voltage: f64,
+    pub lower_bound: f64,
+    pub upper_bound: f64,
+    pub confidence: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DegradationPrediction {
+    pub electrolyzer_id: u8,
+    pub timestamp: DateTime<Utc>,
+    pub features: DegradationFeature,
+    pub predictions: Vec<GPPredictionPoint>,
+    pub remaining_useful_life: f64,
+    pub rul_lower_bound: f64,
+    pub rul_upper_bound: f64,
+    pub current_degradation_rate: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MaintenancePlanItem {
+    pub electrolyzer_id: u8,
+    pub priority: DegradationSeverity,
+    pub predicted_failure_date: DateTime<Utc>,
+    pub remaining_useful_life: f64,
+    pub recommended_maintenance_date: DateTime<Utc>,
+    pub estimated_cost: f64,
+    pub maintenance_type: String,
+    pub description: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MaintenancePlan {
+    pub timestamp: DateTime<Utc>,
+    pub items: Vec<MaintenancePlanItem>,
+    pub total_estimated_cost: f64,
 }

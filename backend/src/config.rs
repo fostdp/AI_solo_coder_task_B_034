@@ -12,6 +12,65 @@ pub struct AppConfig {
     pub optimization: OptimizationConfig,
     pub genetic_algorithm: GeneticAlgorithmConfig,
     pub profinet: ProfinetConfig,
+    pub mea_diagnostics: MeaDiagnosticsConfig,
+    pub leak_detection: LeakDetectionConfig,
+    pub renewable_coupling: RenewableCouplingConfig,
+    pub degradation_prediction: DegradationPredictionConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MeaDiagnosticsConfig {
+    pub eis_fit_max_iterations: u32,
+    pub eis_fit_tolerance: f64,
+    pub membrane_dryout_threshold: f64,
+    pub catalyst_poisoning_threshold: f64,
+    pub contact_resistance_threshold: f64,
+    pub conductivity_trend_window: u32,
+    pub min_confidence: f64,
+    pub diagnosis_interval_secs: u64,
+    pub max_concurrent_diagnoses: usize,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct LeakDetectionConfig {
+    pub ultrasound_frequency_min: f64,
+    pub ultrasound_frequency_max: f64,
+    pub leak_threshold_rms: f64,
+    pub leak_threshold_peak: f64,
+    pub sound_speed_hydrogen: f64,
+    pub diffusion_coefficient: f64,
+    pub trilateration_sensor_count: usize,
+    pub min_leak_rate: f64,
+    pub detection_interval_secs: u64,
+    pub max_concurrent_detections: usize,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RenewableCouplingConfig {
+    pub mpc_horizon: u32,
+    pub mpc_control_weight: f64,
+    pub mpc_rate_weight: f64,
+    pub min_operation_time_secs: u64,
+    pub deadzone_percentage: f64,
+    pub power_ramp_rate_per_sec: f64,
+    pub prediction_horizon_secs: u64,
+    pub control_interval_secs: u64,
+    pub max_power_kw: f64,
+    pub min_power_kw: f64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct DegradationPredictionConfig {
+    pub gp_length_scale: f64,
+    pub gp_signal_variance: f64,
+    pub gp_noise_variance: f64,
+    pub prediction_days: u32,
+    pub confidence_level: f64,
+    pub min_history_points: usize,
+    pub voltage_failure_threshold: f64,
+    pub efficiency_failure_threshold: f64,
+    pub prediction_interval_secs: u64,
+    pub max_concurrent_predictions: usize,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -154,6 +213,53 @@ impl Default for AppConfig {
                 packet_magic: 0x50524F4E,
                 min_packet_size: 12,
                 channel_capacity: 1000,
+            },
+            mea_diagnostics: MeaDiagnosticsConfig {
+                eis_fit_max_iterations: 100,
+                eis_fit_tolerance: 1e-6,
+                membrane_dryout_threshold: 0.15,
+                catalyst_poisoning_threshold: 0.2,
+                contact_resistance_threshold: 0.1,
+                conductivity_trend_window: 100,
+                min_confidence: 0.7,
+                diagnosis_interval_secs: 300,
+                max_concurrent_diagnoses: 3,
+            },
+            leak_detection: LeakDetectionConfig {
+                ultrasound_frequency_min: 30000.0,
+                ultrasound_frequency_max: 80000.0,
+                leak_threshold_rms: 0.01,
+                leak_threshold_peak: 0.05,
+                sound_speed_hydrogen: 1310.0,
+                diffusion_coefficient: 0.61e-4,
+                trilateration_sensor_count: 4,
+                min_leak_rate: 0.001,
+                detection_interval_secs: 10,
+                max_concurrent_detections: 5,
+            },
+            renewable_coupling: RenewableCouplingConfig {
+                mpc_horizon: 10,
+                mpc_control_weight: 1.0,
+                mpc_rate_weight: 0.1,
+                min_operation_time_secs: 1800,
+                deadzone_percentage: 5.0,
+                power_ramp_rate_per_sec: 0.01,
+                prediction_horizon_secs: 300,
+                control_interval_secs: 5,
+                max_power_kw: 100.0,
+                min_power_kw: 10.0,
+            },
+            degradation_prediction: DegradationPredictionConfig {
+                gp_length_scale: 30.0,
+                gp_signal_variance: 0.01,
+                gp_noise_variance: 1e-4,
+                prediction_days: 90,
+                confidence_level: 0.95,
+                min_history_points: 30,
+                voltage_failure_threshold: 2.2,
+                efficiency_failure_threshold: 65.0,
+                prediction_interval_secs: 3600,
+                max_concurrent_predictions: 2,
             },
         }
     }
