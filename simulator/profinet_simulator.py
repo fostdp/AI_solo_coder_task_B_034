@@ -4,9 +4,16 @@ import time
 import random
 import socket
 import struct
+import zlib
 from datetime import datetime
 from dataclasses import dataclass, field
-from typing import List, Dict
+from typing import List, Dict, Optional
+
+MAGIC_NUMBER = 0x50524F4E  # "PRON" in ASCII
+PACKET_HEADER_SIZE = 8
+CRC_SIZE = 4
+CRC_POLYNOMIAL = 0xEDB88320  # CRC-32 (IEEE)
+
 
 SENSOR_TYPES = [
     'voltage',
@@ -101,19 +108,68 @@ def generate_sensor_value(sensor: SensorConfig, electrolyzer: Electrolyzer) -> f
     
     return round(value, 6)
 
-def create_profinet_packet(timestamp: float, electrolyzer_id: int, sensors_data: List[Dict]) -> bytes:
+def calculate_crc32(data: bytes) -> int:
+    """
+    Calculate CRC-32 (IEEE Std 802.3) checksum for data.
+    Matches Rust's crc::CRC_32_ISCSI (0x1EDC6F41 polynomial, reversed).
+    """
+    crc = zlib.crc32(data)
+    return crc & 0xFFFFFFFF
+
+def create_profinet_packet(timestamp: float, electrolyzer_id: int, sensors_data: List[Dict], 
+                           inject_crc_error: bool = False) -> bytes:
+    """
+    Create a Profinet packet with proper frame format:
+    [magic:4][payload_len:4][payload:N][crc:4]
+    
+    Args:
+        timestamp: Unix timestamp with fractional seconds
+        electrolyzer_id: Electrolyzer ID (1-10)
+        sensors_data: List of sensor reading dictionaries
+        inject_crc_error: If True, inject an invalid CRC for testing
+    """
     payload = json.dumps({
         'timestamp': timestamp,
         'electrolyzer_id': electrolyzer_id,
         'sensors': sensors_data
     }).encode('utf-8')
     
-    header = struct.pack('!II', 0x0001, len(payload))
-    return header + payload
+    header = struct.pack('!II', MAGIC_NUMBER, len(payload))
+    
+    crc = calculate_crc32(payload)
+    if inject_crc_error:
+        crc = (crc ^ 0xFFFFFFFF) & 0xFFFFFFFF
+    
+    crc_bytes = struct.pack('!I', crc)
+    
+    return header + payload + crc_bytes
 
-def send_profinet_data(host: str, port: int, electrolyzers: List[Electrolyzer]):
+def create_invalid_packet(reason: str = "random") -> bytes:
+    """
+    Create various invalid packets for testing error handling.
+    """
+    if reason == "too_short":
+        return b'\x00\x00\x00'
+    elif reason == "bad_magic":
+        return struct.pack('!II', 0xDEADBEEF, 4) + b'test' + struct.pack('!I', 0)
+    elif reason == "wrong_length":
+        payload = b'{"test":1}'
+        header = struct.pack('!II', MAGIC_NUMBER, 1000)
+        crc = struct.pack('!I', calculate_crc32(payload))
+        return header + payload + crc
+    elif reason == "bad_crc":
+        payload = b'{"test":1}'
+        header = struct.pack('!II', MAGIC_NUMBER, len(payload))
+        crc = struct.pack('!I', 0xDEADBEEF)
+        return header + payload + crc
+    else:
+        return b'\x00' * 64
+
+def send_profinet_data(host: str, port: int, electrolyzers: List[Electrolyzer],
+                        inject_invalid_packets: bool = True):
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     packet_count = 0
+    invalid_packet_count = 0
     
     try:
         while True:
@@ -134,12 +190,27 @@ def send_profinet_data(host: str, port: int, electrolyzers: List[Electrolyzer]):
                         'y': sensor.y
                     })
                 
+                inject_error = False
+                if inject_invalid_packets and random.random() < 0.005:
+                    inject_error = True
+                    error_type = random.choice(['bad_crc', 'bad_magic', 'wrong_length', 'too_short'])
+                    if error_type == 'bad_crc':
+                        packet = create_profinet_packet(timestamp, electrolyzer.id, sensors_data, inject_crc_error=True)
+                    else:
+                        packet = create_invalid_packet(error_type)
+                    
+                    sock.sendto(packet, (host, port))
+                    invalid_packet_count += 1
+                    print(f"[{datetime.now().strftime('%H:%M:%S')}] ⚠️  Injected invalid packet ({error_type}) "
+                          f"for electrolyzer {electrolyzer.id} (total invalid: {invalid_packet_count})")
+                
                 packet = create_profinet_packet(timestamp, electrolyzer.id, sensors_data)
                 sock.sendto(packet, (host, port))
                 
                 packet_count += 1
                 if packet_count % 50 == 0:
-                    print(f"[{datetime.now().strftime('%H:%M:%S')}] Sent {packet_count} packets, "
+                    print(f"[{datetime.now().strftime('%H:%M:%S')}] Sent {packet_count} valid packets, "
+                          f"{invalid_packet_count} invalid packets, "
                           f"Electrolyzer {electrolyzer.id}: "
                           f"Current={electrolyzer.base_current_density:.2f} A/cm², "
                           f"Temp={electrolyzer.base_water_temp:.1f}°C")
@@ -171,8 +242,23 @@ def send_profinet_data(host: str, port: int, electrolyzers: List[Electrolyzer]):
         sock.close()
 
 def main():
-    host = '127.0.0.1'
-    port = 34567
+    import argparse
+    
+    parser = argparse.ArgumentParser(description='Profinet Simulator for PEM Electrolyzer System')
+    parser.add_argument('--host', default='127.0.0.1', help='Target host IP address')
+    parser.add_argument('--port', type=int, default=34567, help='Target UDP port')
+    parser.add_argument('--no-inject-errors', action='store_true', 
+                        help='Disable injection of invalid packets for testing')
+    parser.add_argument('--seed', type=int, help='Random seed for reproducible testing')
+    
+    args = parser.parse_args()
+    
+    if args.seed is not None:
+        random.seed(args.seed)
+    
+    host = args.host
+    port = args.port
+    inject_errors = not args.no_inject_errors
     
     print("=" * 60)
     print("Profinet Simulator for PEM Electrolyzer System")
@@ -182,6 +268,10 @@ def main():
     print(f"Total sensors: {ELECTROLYZER_COUNT * SENSORS_PER_ELECTROLYZER}")
     print(f"Report interval: 2 seconds")
     print(f"Target: {host}:{port}")
+    print(f"Packet format: [magic:4][len:4][payload:N][crc:4]")
+    print(f"Magic number: 0x{MAGIC_NUMBER:08X} ('PRON')")
+    print(f"CRC polynomial: CRC-32 IEEE (0x{CRC_POLYNOMIAL:08X})")
+    print(f"Inject invalid packets: {'YES (0.5% probability)' if inject_errors else 'NO'}")
     print("=" * 60)
     
     electrolyzers = []
@@ -196,7 +286,7 @@ def main():
         electrolyzers.append(electrolyzer)
     
     print("Starting simulator... Press Ctrl+C to stop.")
-    send_profinet_data(host, port, electrolyzers)
+    send_profinet_data(host, port, electrolyzers, inject_invalid_packets=inject_errors)
 
 if __name__ == '__main__':
     main()

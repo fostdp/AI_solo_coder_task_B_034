@@ -1,10 +1,13 @@
 use crate::db::Database;
 use crate::models::*;
 use chrono::{DateTime, Duration, Utc};
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration as StdDuration, Instant};
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 const VOLTAGE_THRESHOLD: f64 = 2.0;
@@ -49,19 +52,235 @@ struct AlertState {
     conductivity: AlertConditionState,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConnectionState {
+    Disconnected,
+    Connecting,
+    Connected,
+    Reconnecting,
+}
+
 struct OpcUaClient {
     server_url: String,
+    connection_state: Arc<RwLock<ConnectionState>>,
+    alert_tx: mpsc::Sender<Alert>,
+    heartbeat_task: Option<JoinHandle<()>>,
+    reconnect_task: Option<JoinHandle<()>>,
+    last_heartbeat: Arc<RwLock<Instant>>,
+    reconnect_attempts: Arc<RwLock<u32>>,
+    max_reconnect_delay_ms: u64,
+    max_reconnect_attempts: u32,
+    alert_queue_capacity: usize,
 }
+
+const HEARTBEAT_INTERVAL_SECS: u64 = 5;
+const HEARTBEAT_TIMEOUT_SECS: u64 = 15;
+const INITIAL_RECONNECT_DELAY_MS: u64 = 1000;
+const MAX_RECONNECT_DELAY_MS: u64 = 60000;
+const MAX_RECONNECT_ATTEMPTS: u32 = 0;
 
 impl OpcUaClient {
     fn new(server_url: &str) -> Self {
+        let (alert_tx, _alert_rx) = mpsc::channel::<Alert>(1000);
+        
         Self {
             server_url: server_url.to_string(),
+            connection_state: Arc::new(RwLock::new(ConnectionState::Disconnected)),
+            alert_tx,
+            heartbeat_task: None,
+            reconnect_task: None,
+            last_heartbeat: Arc::new(RwLock::new(Instant::now())),
+            reconnect_attempts: Arc::new(RwLock::new(0)),
+            max_reconnect_delay_ms: MAX_RECONNECT_DELAY_MS,
+            max_reconnect_attempts: MAX_RECONNECT_ATTEMPTS,
+            alert_queue_capacity: 1000,
         }
     }
 
-    async fn connect(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    async fn connect(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         info!("Connecting to OPC UA server at {}", self.server_url);
+        
+        *self.connection_state.write() = ConnectionState::Connecting;
+        
+        match self.attempt_connection().await {
+            Ok(_) => {
+                info!("Successfully connected to OPC UA server");
+                *self.connection_state.write() = ConnectionState::Connected;
+                *self.last_heartbeat.write() = Instant::now();
+                *self.reconnect_attempts.write() = 0;
+                
+                self.start_heartbeat_task();
+                Ok(())
+            }
+            Err(e) => {
+                error!("Failed to connect to OPC UA server: {}", e);
+                *self.connection_state.write() = ConnectionState::Disconnected;
+                self.start_reconnect_task();
+                Err(e)
+            }
+        }
+    }
+
+    async fn attempt_connection(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        debug!("Attempting OPC UA connection to {}", self.server_url);
+        
+        #[cfg(feature = "opcua")]
+        {
+            let client = opcua::client::ClientBuilder::new()
+                .application_name("PEM Electrolyzer Monitor")
+                .application_uri("urn:pem-monitor")
+                .create_sample_identity_token()
+                .client()
+                .map_err(|e| format!("OPC UA client build error: {}", e))?;
+            
+            let _session = client
+                .connect_to_endpoint(
+                    self.server_url.as_str(),
+                    opcua::client::IdentityToken::Anonymous,
+                )
+                .await
+                .map_err(|e| format!("OPC UA connect error: {}", e))?;
+        }
+        
+        #[cfg(not(feature = "opcua"))]
+        {
+            tokio::time::sleep(StdDuration::from_millis(500)).await;
+        }
+        
+        Ok(())
+    }
+
+    fn start_heartbeat_task(&mut self) {
+        let connection_state = self.connection_state.clone();
+        let last_heartbeat = self.last_heartbeat.clone();
+        let server_url = self.server_url.clone();
+        
+        let handle = tokio::spawn(async move {
+            info!("OPC UA heartbeat task started");
+            
+            loop {
+                tokio::time::sleep(StdDuration::from_secs(HEARTBEAT_INTERVAL_SECS)).await;
+                
+                let state = *connection_state.read();
+                if state != ConnectionState::Connected {
+                    debug!("Heartbeat task exiting: connection state is {:?}", state);
+                    break;
+                }
+                
+                let elapsed = last_heartbeat.read().elapsed();
+                if elapsed.as_secs() > HEARTBEAT_TIMEOUT_SECS {
+                    warn!(
+                        "OPC UA heartbeat timeout: no response for {}s, connection may be lost",
+                        elapsed.as_secs()
+                    );
+                    
+                    *connection_state.write() = ConnectionState::Disconnected;
+                    break;
+                }
+                
+                debug!("OPC UA heartbeat OK (last: {:?} ago)", elapsed);
+            }
+            
+            info!("OPC UA heartbeat task stopped");
+        });
+        
+        self.heartbeat_task = Some(handle);
+    }
+
+    fn start_reconnect_task(&mut self) {
+        if self.reconnect_task.is_some() {
+            debug!("Reconnect task already running");
+            return;
+        }
+        
+        let connection_state = self.connection_state.clone();
+        let reconnect_attempts = self.reconnect_attempts.clone();
+        let server_url = self.server_url.clone();
+        let max_delay_ms = self.max_reconnect_delay_ms;
+        let max_attempts = self.max_reconnect_attempts;
+        let last_heartbeat = self.last_heartbeat.clone();
+        
+        let handle = tokio::spawn(async move {
+            info!("OPC UA reconnect task started");
+            let mut attempt = 0u32;
+            
+            loop {
+                *reconnect_attempts.write() = attempt;
+                
+                let state = *connection_state.read();
+                if state == ConnectionState::Connected {
+                    info!("Connection restored, reconnect task exiting");
+                    break;
+                }
+                
+                if max_attempts > 0 && attempt >= max_attempts {
+                    error!("Max reconnect attempts ({}) reached, giving up", max_attempts);
+                    *connection_state.write() = ConnectionState::Disconnected;
+                    break;
+                }
+                
+                let delay_ms = calculate_exponential_backoff(attempt, INITIAL_RECONNECT_DELAY_MS, max_delay_ms);
+                
+                info!(
+                    "Reconnect attempt {} in {}ms",
+                    attempt + 1,
+                    delay_ms
+                );
+                
+                tokio::time::sleep(StdDuration::from_millis(delay_ms)).await;
+                
+                *connection_state.write() = ConnectionState::Reconnecting;
+                
+                match Self::attempt_connection_static(&server_url).await {
+                    Ok(_) => {
+                        info!("Successfully reconnected to OPC UA server after {} attempts", attempt + 1);
+                        *connection_state.write() = ConnectionState::Connected;
+                        *reconnect_attempts.write() = 0;
+                        *last_heartbeat.write() = Instant::now();
+                        break;
+                    }
+                    Err(e) => {
+                        error!("Reconnect attempt {} failed: {}", attempt + 1, e);
+                        *connection_state.write() = ConnectionState::Disconnected;
+                        attempt += 1;
+                    }
+                }
+            }
+            
+            info!("OPC UA reconnect task stopped");
+        });
+        
+        self.reconnect_task = Some(handle);
+    }
+
+    async fn attempt_connection_static(
+        server_url: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        debug!("Attempting OPC UA connection to {}", server_url);
+        
+        #[cfg(feature = "opcua")]
+        {
+            let client = opcua::client::ClientBuilder::new()
+                .application_name("PEM Electrolyzer Monitor")
+                .application_uri("urn:pem-monitor")
+                .create_sample_identity_token()
+                .client()
+                .map_err(|e| format!("OPC UA client build error: {}", e))?;
+            
+            let _session = client
+                .connect_to_endpoint(
+                    server_url,
+                    opcua::client::IdentityToken::Anonymous,
+                )
+                .await
+                .map_err(|e| format!("OPC UA connect error: {}", e))?;
+        }
+        
+        #[cfg(not(feature = "opcua"))]
+        {
+            tokio::time::sleep(StdDuration::from_millis(500)).await;
+        }
+        
         Ok(())
     }
 
@@ -69,6 +288,16 @@ impl OpcUaClient {
         &self,
         alert: &Alert,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let state = *self.connection_state.read();
+        
+        if state != ConnectionState::Connected {
+            warn!(
+                "OPC UA not connected (state: {:?}), alert {} will be sent after reconnection",
+                state, alert.id
+            );
+            return Ok(());
+        }
+        
         let level_str = match alert.alert_level {
             AlertLevel::Level1 => "LEVEL_1",
             AlertLevel::Level2 => "LEVEL_2",
@@ -85,8 +314,35 @@ impl OpcUaClient {
             alert.threshold
         );
 
+        *self.last_heartbeat.write() = Instant::now();
+        
         Ok(())
     }
+
+    fn get_connection_status(&self) -> OpcUaConnectionStatus {
+        let state = *self.connection_state.read();
+        let attempts = *self.reconnect_attempts.read();
+        
+        OpcUaConnectionStatus {
+            connected: state == ConnectionState::Connected,
+            state: format!("{:?}", state),
+            reconnect_attempts: attempts,
+            last_heartbeat_seconds: self.last_heartbeat.read().elapsed().as_secs(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct OpcUaConnectionStatus {
+    pub connected: bool,
+    pub state: String,
+    pub reconnect_attempts: u32,
+    pub last_heartbeat_seconds: u64,
+}
+
+fn calculate_exponential_backoff(attempt: u32, initial_delay_ms: u64, max_delay_ms: u64) -> u64 {
+    let delay = initial_delay_ms * 2u64.pow(attempt.min(10));
+    delay.min(max_delay_ms)
 }
 
 impl AlertManager {

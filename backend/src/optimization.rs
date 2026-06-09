@@ -1,9 +1,12 @@
 use crate::models::*;
 use chrono::{DateTime, Utc};
-use log::{debug, info, warn};
+use log::{debug, error, info, warn};
 use rand::Rng;
 use rand_distr::{Distribution, Normal};
+use std::collections::HashSet;
 use std::f64::consts::E;
+use std::sync::Arc;
+use tokio::sync::{mpsc, Semaphore};
 use uuid::Uuid;
 
 const FARADAY_CONSTANT: f64 = 96485.3321;
@@ -396,12 +399,12 @@ impl GeneticAlgorithmOptimizer {
 pub struct OptimizationService {
     pub model: EfficiencyModel,
     optimizer: GeneticAlgorithmOptimizer,
-    min_current_density: f64,
-    max_current_density: f64,
-    min_temp: f64,
-    max_temp: f64,
-    efficiency_threshold: f64,
-    target_efficiency: f64,
+    pub min_current_density: f64,
+    pub max_current_density: f64,
+    pub min_temp: f64,
+    pub max_temp: f64,
+    pub efficiency_threshold: f64,
+    pub target_efficiency: f64,
 }
 
 impl Default for OptimizationService {
@@ -532,6 +535,184 @@ impl OptimizationService {
 
         curve
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct OptimizationTask {
+    pub electrolyzer_id: u8,
+    pub current_density: f64,
+    pub cell_voltage: f64,
+    pub water_temp: f64,
+    pub current_efficiency: f64,
+    pub timestamp: DateTime<Utc>,
+}
+
+pub struct OptimizationQueueHandle {
+    task_tx: mpsc::Sender<OptimizationTask>,
+    result_rx: Option<mpsc::Receiver<OptimizationSuggestion>>,
+    pending_electrolyzers: Arc<std::sync::Mutex<HashSet<u8>>>,
+}
+
+impl OptimizationQueueHandle {
+    pub async fn submit_optimization(
+        &self,
+        task: OptimizationTask,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let mut pending = self.pending_electrolyzers.lock().unwrap();
+        
+        if pending.contains(&task.electrolyzer_id) {
+            debug!(
+                "Optimization for electrolyzer {} already in queue, skipping",
+                task.electrolyzer_id
+            );
+            return Ok(());
+        }
+        
+        pending.insert(task.electrolyzer_id);
+        drop(pending);
+        
+        if let Err(e) = self.task_tx.send(task).await {
+            let mut pending = self.pending_electrolyzers.lock().unwrap();
+            pending.remove(&e.0.electrolyzer_id);
+            return Err(format!("Failed to submit optimization task: {}", e).into());
+        }
+        
+        Ok(())
+    }
+
+    pub fn poll_result(&mut self) -> Option<OptimizationSuggestion> {
+        self.result_rx.as_mut().and_then(|rx| rx.try_recv().ok())
+    }
+}
+
+pub struct GlobalOptimizationQueue {
+    optimization_service: Arc<OptimizationService>,
+    task_rx: mpsc::Receiver<OptimizationTask>,
+    result_tx: mpsc::Sender<OptimizationSuggestion>,
+    pending_electrolyzers: Arc<std::sync::Mutex<HashSet<u8>>>,
+    concurrency_semaphore: Arc<Semaphore>,
+    max_concurrent_tasks: usize,
+}
+
+impl GlobalOptimizationQueue {
+    pub fn new(
+        optimization_service: Arc<OptimizationService>,
+        max_concurrent_tasks: usize,
+        queue_capacity: usize,
+    ) -> (Self, OptimizationQueueHandle) {
+        let (task_tx, task_rx) = mpsc::channel::<OptimizationTask>(queue_capacity);
+        let (result_tx, result_rx) = mpsc::channel::<OptimizationSuggestion>(queue_capacity);
+        let pending_electrolyzers = Arc::new(std::sync::Mutex::new(HashSet::new()));
+
+        let handle = OptimizationQueueHandle {
+            task_tx,
+            result_rx: Some(result_rx),
+            pending_electrolyzers: pending_electrolyzers.clone(),
+        };
+
+        let queue = Self {
+            optimization_service,
+            task_rx,
+            result_tx,
+            pending_electrolyzers,
+            concurrency_semaphore: Arc::new(Semaphore::new(max_concurrent_tasks)),
+            max_concurrent_tasks,
+        };
+
+        (queue, handle)
+    }
+
+    pub async fn run(mut self) {
+        info!(
+            "Global optimization queue started with max {} concurrent tasks",
+            self.max_concurrent_tasks
+        );
+
+        while let Some(task) = self.task_rx.recv().await {
+            let semaphore = self.concurrency_semaphore.clone();
+            let service = self.optimization_service.clone();
+            let result_tx = self.result_tx.clone();
+            let pending = self.pending_electrolyzers.clone();
+            let electrolyzer_id = task.electrolyzer_id;
+
+            tokio::spawn(async move {
+                let _permit = match semaphore.acquire().await {
+                    Ok(permit) => permit,
+                    Err(e) => {
+                        error!("Semaphore acquire error: {}", e);
+                        let mut pending = pending.lock().unwrap();
+                        pending.remove(&electrolyzer_id);
+                        return;
+                    }
+                };
+
+                debug!(
+                    "Starting optimization for electrolyzer {} (efficiency: {:.2}%)",
+                    electrolyzer_id, task.current_efficiency
+                );
+
+                let start_time = std::time::Instant::now();
+                
+                let result = tokio::task::spawn_blocking(move || {
+                    service.check_and_optimize(
+                        task.electrolyzer_id,
+                        task.current_density,
+                        task.cell_voltage,
+                        task.water_temp,
+                    )
+                })
+                .await;
+
+                let elapsed = start_time.elapsed();
+
+                let mut pending = pending.lock().unwrap();
+                pending.remove(&electrolyzer_id);
+                drop(pending);
+
+                match result {
+                    Ok(Some(suggestion)) => {
+                        info!(
+                            "Optimization completed for electrolyzer {} in {:.2?}, expected efficiency: {:.2}%",
+                            electrolyzer_id, elapsed, suggestion.expected_efficiency
+                        );
+                        
+                        if let Err(e) = result_tx.send(suggestion).await {
+                            error!("Failed to send optimization result: {}", e);
+                        }
+                    }
+                    Ok(None) => {
+                        debug!(
+                            "No optimization needed for electrolyzer {} (completed in {:.2?})",
+                            electrolyzer_id, elapsed
+                        );
+                    }
+                    Err(e) => {
+                        error!(
+                            "Optimization task failed for electrolyzer {}: {}",
+                            electrolyzer_id, e
+                        );
+                    }
+                }
+            });
+        }
+
+        warn!("Global optimization queue task receiver closed");
+    }
+
+    pub fn get_queue_stats(&self) -> OptimizationQueueStats {
+        OptimizationQueueStats {
+            pending_tasks: self.task_rx.len(),
+            active_tasks: self.max_concurrent_tasks - self.concurrency_semaphore.available_permits(),
+            max_concurrent: self.max_concurrent_tasks,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct OptimizationQueueStats {
+    pub pending_tasks: usize,
+    pub active_tasks: usize,
+    pub max_concurrent: usize,
 }
 
 #[cfg(test)]

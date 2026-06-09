@@ -9,7 +9,9 @@ use crate::alerts::AlertManager;
 use crate::api::{start_api_server, AppState};
 use crate::db::Database;
 use crate::models::*;
-use crate::optimization::OptimizationService;
+use crate::optimization::{
+    GlobalOptimizationQueue, OptimizationQueueHandle, OptimizationService, OptimizationTask,
+};
 use crate::profinet::{ProfinetReceiver, SensorDataBatch};
 use chrono::Utc;
 use log::{error, info, warn};
@@ -17,6 +19,9 @@ use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
+
+const MAX_CONCURRENT_OPTIMIZATIONS: usize = 3;
+const OPTIMIZATION_QUEUE_CAPACITY: usize = 100;
 
 const ACTIVE_AREA: f64 = 1.0;
 
@@ -48,7 +53,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     );
 
     let alert_manager = AlertManager::new(db.clone(), Some(&config.opcua_server_url));
-    let optimization_service = OptimizationService::new();
+    let optimization_service = Arc::new(OptimizationService::new());
+
+    let (optimization_queue, optimization_queue_handle) = GlobalOptimizationQueue::new(
+        optimization_service.clone(),
+        MAX_CONCURRENT_OPTIMIZATIONS,
+        OPTIMIZATION_QUEUE_CAPACITY,
+    );
 
     let latest_status: Arc<RwLock<HashMap<u8, ElectrolyzerStatus>>> =
         Arc::new(RwLock::new(HashMap::new()));
@@ -84,9 +95,63 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         start_api_server(api_state, api_port).await;
     });
 
+    let optimization_queue_handle_clone = optimization_queue_handle.clone();
+    let db_clone = db.clone();
+    let latest_optimizations_clone = latest_optimizations.clone();
+    
+    let optimization_queue_handle_main = tokio::spawn(async move {
+        optimization_queue.run().await;
+    });
+
+    let mut optimization_result_handle = optimization_queue_handle_clone.clone();
+    let db_for_results = db_clone.clone();
+    let latest_opts = latest_optimizations_clone.clone();
+    
+    let optimization_result_processor = tokio::spawn(async move {
+        let mut last_stats_log = Utc::now();
+        
+        loop {
+            tokio::select! {
+                Some(suggestion) = async {
+                    loop {
+                        match optimization_result_handle.poll_result() {
+                            Some(s) => break Some(s),
+                            None => {
+                                tokio::time::sleep(Duration::from_millis(100)).await;
+                            }
+                        }
+                    }
+                } => {
+                    {
+                        let mut lo = latest_opts.write();
+                        lo.push(suggestion.clone());
+                        if lo.len() > 100 {
+                            lo.drain(0..lo.len() - 100);
+                        }
+                    }
+
+                    let db = db_for_results.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = db.insert_optimization_suggestion(&suggestion).await {
+                            error!("Failed to insert optimization suggestion: {}", e);
+                        }
+                    });
+                }
+                _ = tokio::time::sleep(Duration::from_secs(60)) => {
+                    let now = Utc::now();
+                    if (now - last_stats_log).to_std().unwrap_or_default() >= Duration::from_secs(60) {
+                        debug!("Optimization queue stats check");
+                        last_stats_log = now;
+                    }
+                }
+            }
+        }
+    });
+
     let processing_handle = tokio::spawn(async move {
         let mut last_summary_time = Utc::now();
         let summary_interval = Duration::from_secs(60);
+        let mut queue_handle = optimization_queue_handle.clone();
 
         loop {
             tokio::select! {
@@ -96,6 +161,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         &db,
                         &alert_manager,
                         &optimization_service,
+                        &mut queue_handle,
                         &latest_status,
                         &latest_sensors,
                         &latest_alerts,
@@ -119,7 +185,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
     });
 
-    tokio::try_join!(profinet_handle, api_handle, processing_handle)?;
+    tokio::try_join!(
+        profinet_handle,
+        api_handle,
+        processing_handle,
+        optimization_queue_handle_main,
+        optimization_result_processor
+    )?;
 
     Ok(())
 }
@@ -128,11 +200,12 @@ async fn process_batch(
     batch: &SensorDataBatch,
     db: &Database,
     alert_manager: &AlertManager,
-    optimization_service: &OptimizationService,
+    optimization_service: &Arc<OptimizationService>,
+    optimization_queue_handle: &mut OptimizationQueueHandle,
     latest_status: &Arc<RwLock<HashMap<u8, ElectrolyzerStatus>>>,
     latest_sensors: &Arc<RwLock<HashMap<u8, Vec<SensorData>>>>,
     latest_alerts: &Arc<RwLock<Vec<Alert>>>,
-    latest_optimizations: &Arc<RwLock<Vec<OptimizationSuggestion>>>,
+    _latest_optimizations: &Arc<RwLock<Vec<OptimizationSuggestion>>>,
 ) {
     let electrolyzer_id = batch.electrolyzer_id;
     let timestamp = batch.timestamp;
@@ -225,26 +298,22 @@ async fn process_batch(
         }
     });
 
-    if let Some(suggestion) = optimization_service.check_and_optimize(
-        electrolyzer_id,
-        batch.avg_current_density,
-        batch.avg_voltage,
-        batch.avg_water_temp,
-    ) {
-        {
-            let mut lo = latest_optimizations.write();
-            lo.push(suggestion.clone());
-            if lo.len() > 100 {
-                lo.drain(0..lo.len() - 100);
-            }
-        }
+    if efficiency < optimization_service.efficiency_threshold {
+        let task = OptimizationTask {
+            electrolyzer_id,
+            current_density: batch.avg_current_density,
+            cell_voltage: batch.avg_voltage,
+            water_temp: batch.avg_water_temp,
+            current_efficiency: efficiency,
+            timestamp,
+        };
 
-        let db_clone = db.clone();
-        tokio::spawn(async move {
-            if let Err(e) = db_clone.insert_optimization_suggestion(&suggestion).await {
-                error!("Failed to insert optimization suggestion: {}", e);
-            }
-        });
+        if let Err(e) = optimization_queue_handle.submit_optimization(task).await {
+            warn!(
+                "Failed to submit optimization task for electrolyzer {}: {}",
+                electrolyzer_id, e
+            );
+        }
     }
 }
 

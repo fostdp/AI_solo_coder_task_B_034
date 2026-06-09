@@ -1,12 +1,19 @@
 use crate::db::Database;
 use crate::models::*;
-use byteorder::{BigEndian, ReadBytesExt};
+use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 use chrono::{DateTime, TimeZone, Utc};
+use crc::{Crc, CRC_32_ISCSI};
 use std::collections::HashMap;
 use std::io::Cursor;
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
+
+pub const PROFINET_CRC: Crc<u32> = Crc::<u32>::new(&CRC_32_ISCSI);
+const PACKET_HEADER_SIZE: usize = 8;
+const CRC_SIZE: usize = 4;
+const MIN_PACKET_SIZE: usize = PACKET_HEADER_SIZE + CRC_SIZE;
 
 #[derive(Debug, Clone)]
 pub struct ProfinetReceiver {
@@ -48,15 +55,27 @@ impl ProfinetReceiver {
         log::info!("Profinet receiver listening on {}", addr);
 
         let mut buf = vec![0u8; 65535];
+        let mut invalid_packet_count = 0u64;
+        let mut last_invalid_log = Instant::now();
 
         loop {
-            let (len, _src) = socket.recv_from(&mut buf).await?;
+            let (len, src) = socket.recv_from(&mut buf).await?;
             
-            if len < 8 {
+            if len < MIN_PACKET_SIZE {
+                invalid_packet_count += 1;
+                if last_invalid_log.elapsed().as_secs() >= 60 {
+                    log::warn!(
+                        "Profinet packet too short from {}: {} bytes (min {}), total invalid: {}",
+                        src, len, MIN_PACKET_SIZE, invalid_packet_count
+                    );
+                    last_invalid_log = Instant::now();
+                }
                 continue;
             }
 
-            match self.parse_packet(&buf[..len]).await {
+            let packet_data = &buf[..len];
+            
+            match self.parse_packet(packet_data).await {
                 Ok(batch) => {
                     let db = self.db.clone();
                     let sensors = batch.sensors.clone();
@@ -72,7 +91,24 @@ impl ProfinetReceiver {
                     }
                 }
                 Err(e) => {
-                    log::warn!("Failed to parse Profinet packet: {}", e);
+                    invalid_packet_count += 1;
+                    
+                    log::error!(
+                        "⚠️  Profinet packet parse error from {} ({} bytes): {}\n\
+                         Packet hex dump (first 64 bytes): {}",
+                        src, len, e,
+                        packet_data.iter()
+                            .take(64)
+                            .map(|b| format!("{:02X}", b))
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    );
+                    
+                    if last_invalid_log.elapsed().as_secs() >= 60 {
+                        log::warn!("Total invalid Profinet packets in last minute: {}", invalid_packet_count);
+                        invalid_packet_count = 0;
+                        last_invalid_log = Instant::now();
+                    }
                 }
             }
         }
@@ -84,18 +120,62 @@ impl ProfinetReceiver {
     ) -> Result<SensorDataBatch, Box<dyn std::error::Error + Send + Sync>> {
         let mut cursor = Cursor::new(data);
         
-        let _magic = cursor.read_u32::<BigEndian>()?;
+        let magic = cursor.read_u32::<BigEndian>()?;
+        
+        if magic != 0x50524F4E {
+            return Err(format!(
+                "Invalid magic number: 0x{:08X}, expected: 0x50524F4E (PRON)",
+                magic
+            )
+            .into());
+        }
+        
         let payload_len = cursor.read_u32::<BigEndian>()? as usize;
+        
+        let expected_total_len = PACKET_HEADER_SIZE + payload_len + CRC_SIZE;
+        if data.len() != expected_total_len {
+            return Err(format!(
+                "Packet length mismatch: actual {} bytes, expected {} bytes (header: {} + payload: {} + crc: {})",
+                data.len(), expected_total_len, PACKET_HEADER_SIZE, payload_len, CRC_SIZE
+            )
+            .into());
+        }
         
         let payload_start = cursor.position() as usize;
         let payload_end = payload_start + payload_len;
         
-        if payload_end > data.len() {
-            return Err("Invalid packet length".into());
+        if payload_end + CRC_SIZE > data.len() {
+            return Err(format!(
+                "Payload overflow: payload_end={}, crc_end={}, data_len={}",
+                payload_end, payload_end + CRC_SIZE, data.len()
+            )
+            .into());
         }
         
         let payload = &data[payload_start..payload_end];
-        let packet: ProfinetPacket = serde_json::from_slice(payload)?;
+        
+        let crc_start = payload_end;
+        let crc_bytes = &data[crc_start..crc_start + CRC_SIZE];
+        let mut crc_cursor = Cursor::new(crc_bytes);
+        let received_crc = crc_cursor.read_u32::<BigEndian>()?;
+        
+        let calculated_crc = PROFINET_CRC.checksum(payload);
+        if calculated_crc != received_crc {
+            return Err(format!(
+                "CRC check failed: received 0x{:08X}, calculated 0x{:08X}",
+                received_crc, calculated_crc
+            )
+            .into());
+        }
+        
+        let packet: ProfinetPacket = serde_json::from_slice(payload).map_err(|e| {
+            format!(
+                "JSON parse error (payload len: {}): {}, first 128 chars: {}",
+                payload_len,
+                e,
+                std::str::from_utf8(&payload[..payload_len.min(128)]).unwrap_or("<invalid utf8>")
+            )
+        })?;
         
         let timestamp = Utc
             .timestamp_opt(
