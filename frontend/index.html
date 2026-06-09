@@ -1,0 +1,197 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>质子交换膜电解水制氢系统监控与能效优化平台</title>
+    <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+    <header class="header">
+        <div class="header-content">
+            <h1>⚡ 质子交换膜电解水制氢系统监控与能效优化平台</h1>
+            <div class="header-info">
+                <span id="current-time">--:--:--</span>
+                <span class="status-badge status-online">● 系统在线</span>
+            </div>
+        </div>
+    </header>
+
+    <main class="main-container">
+        <section class="metrics-section">
+            <div class="metric-card">
+                <div class="metric-icon">💧</div>
+                <div class="metric-info">
+                    <div class="metric-label">总氢气产量</div>
+                    <div class="metric-value" id="total-hydrogen">0.00</div>
+                    <div class="metric-unit">m³</div>
+                </div>
+                <div class="metric-trend up">↑ 2.3%</div>
+            </div>
+            <div class="metric-card">
+                <div class="metric-icon">⚡</div>
+                <div class="metric-info">
+                    <div class="metric-label">平均效率</div>
+                    <div class="metric-value" id="avg-efficiency">0.0</div>
+                    <div class="metric-unit">%</div>
+                </div>
+                <div class="metric-trend" id="efficiency-trend">--</div>
+            </div>
+            <div class="metric-card">
+                <div class="metric-icon">🔌</div>
+                <div class="metric-info">
+                    <div class="metric-label">累计电耗</div>
+                    <div class="metric-value" id="total-power">0.00</div>
+                    <div class="metric-unit">kWh</div>
+                </div>
+                <div class="metric-trend down">↓ 1.1%</div>
+            </div>
+            <div class="metric-card">
+                <div class="metric-icon">🔧</div>
+                <div class="metric-info">
+                    <div class="metric-label">运行电解槽</div>
+                    <div class="metric-value" id="active-electrolyzers">0</div>
+                    <div class="metric-unit">/ 10 台</div>
+                </div>
+                <div class="metric-trend">正常</div>
+            </div>
+        </section>
+
+        <div class="content-grid">
+            <section class="electrolyzers-section" id="electrolyzers-section">
+                <div class="section-header">
+                    <h2>电解槽列表</h2>
+                    <div class="filter-buttons">
+                        <button class="btn active" data-filter="all">全部</button>
+                        <button class="btn" data-filter="optimal">最优</button>
+                        <button class="btn" data-filter="normal">正常</button>
+                        <button class="btn" data-filter="warning">警告</button>
+                    </div>
+                </div>
+                <div class="electrolyzer-grid" id="electrolyzer-grid">
+                </div>
+            </section>
+
+            <section class="detail-section" id="detail-section" style="display: none;">
+                <div class="section-header">
+                    <h2 id="detail-title">电解槽 #1 详细信息</h2>
+                    <button class="btn btn-secondary" id="back-btn">← 返回列表</button>
+                </div>
+
+                <div class="detail-content">
+                    <div class="canvas-container">
+                        <h3>电解槽剖面图</h3>
+                        <canvas id="electrolyzer-canvas" width="800" height="500"></canvas>
+                        <div class="canvas-legend">
+                            <div class="legend-item">
+                                <span class="legend-color" style="background: #4CAF50;"></span>
+                                <span>正常 (&lt;3%)</span>
+                            </div>
+                            <div class="legend-item">
+                                <span class="legend-color" style="background: #FFC107;"></span>
+                                <span>警告 (3%-7%)</span>
+                            </div>
+                            <div class="legend-item">
+                                <span class="legend-color" style="background: #F44336;"></span>
+                                <span>异常 (&gt;7%)</span>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="sensor-info-panel">
+                        <h3>传感器信息</h3>
+                        <div class="sensor-details" id="sensor-details">
+                            <p class="placeholder">点击传感器查看详细信息</p>
+                        </div>
+                    </div>
+
+                    <div class="charts-container">
+                        <div class="chart-card">
+                            <h3>近2小时参数趋势</h3>
+                            <canvas id="trend-chart" width="400" height="200"></canvas>
+                        </div>
+                        <div class="chart-card">
+                            <h3>效率曲线</h3>
+                            <canvas id="efficiency-chart" width="400" height="200"></canvas>
+                        </div>
+                    </div>
+
+                    <div class="status-cards">
+                        <div class="status-card">
+                            <div class="status-label">电流密度</div>
+                            <div class="status-value" id="status-current">--</div>
+                            <div class="status-unit">A/cm²</div>
+                        </div>
+                        <div class="status-card">
+                            <div class="status-label">水温</div>
+                            <div class="status-value" id="status-temp">--</div>
+                            <div class="status-unit">°C</div>
+                        </div>
+                        <div class="status-card">
+                            <div class="status-label">效率</div>
+                            <div class="status-value" id="status-efficiency">--</div>
+                            <div class="status-unit">%</div>
+                        </div>
+                        <div class="status-card">
+                            <div class="status-label">氢气纯度</div>
+                            <div class="status-value" id="status-purity">--</div>
+                            <div class="status-unit">%</div>
+                        </div>
+                        <div class="status-card">
+                            <div class="status-label">膜电导率</div>
+                            <div class="status-value" id="status-conductivity">--</div>
+                            <div class="status-unit">S/cm</div>
+                        </div>
+                    </div>
+                </div>
+            </section>
+        </div>
+
+        <section class="alerts-section">
+            <div class="section-header">
+                <h2>🚨 告警信息</h2>
+                <span class="alert-count" id="alert-count">0 条活跃告警</span>
+            </div>
+            <div class="alerts-list" id="alerts-list">
+                <p class="placeholder">暂无告警信息</p>
+            </div>
+        </section>
+
+        <section class="optimization-section">
+            <div class="section-header">
+                <h2>📊 能效优化建议</h2>
+            </div>
+            <div class="optimization-list" id="optimization-list">
+                <p class="placeholder">暂无优化建议</p>
+            </div>
+        </section>
+    </main>
+
+    <div class="modal-overlay" id="sensor-modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3 id="modal-title">传感器详情</h3>
+                <button class="btn-close" id="modal-close">×</button>
+            </div>
+            <div class="modal-body" id="modal-body">
+            </div>
+        </div>
+    </div>
+
+    <div class="modal-overlay" id="optimization-modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3>⚙️ 能效优化方案</h3>
+                <button class="btn-close" id="optimization-modal-close">×</button>
+            </div>
+            <div class="modal-body" id="optimization-modal-body">
+            </div>
+        </div>
+    </div>
+
+    <script src="js/api.js"></script>
+    <script src="js/canvas.js"></script>
+    <script src="js/charts.js"></script>
+    <script src="js/main.js"></script>
+</body>
+</html>
