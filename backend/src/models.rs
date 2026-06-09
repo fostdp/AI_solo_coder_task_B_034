@@ -296,6 +296,8 @@ pub struct SpectralFeatures {
     pub spectral_centroid: f64,
     pub kurtosis: f64,
     pub peak_amplitude: f64,
+    pub snr: f64,
+    pub noise_floor: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

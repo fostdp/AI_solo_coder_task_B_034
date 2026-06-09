@@ -1,0 +1,13 @@
+D:\SOLO-2\AI_solo_coder_task_B_034\backend\target\debug\deps\bstr-6f906671a920827c.d: C:\Users\y\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\bstr-1.12.1\src\lib.rs C:\Users\y\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\bstr-1.12.1\src\ascii.rs C:\Users\y\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\bstr-1.12.1\src\bstr.rs C:\Users\y\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\bstr-1.12.1\src\byteset\mod.rs C:\Users\y\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\bstr-1.12.1\src\byteset\scalar.rs C:\Users\y\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\bstr-1.12.1\src\escape_bytes.rs C:\Users\y\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\bstr-1.12.1\src\ext_slice.rs C:\Users\y\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\bstr-1.12.1\src\impls.rs C:\Users\y\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\bstr-1.12.1\src\utf8.rs
+
+D:\SOLO-2\AI_solo_coder_task_B_034\backend\target\debug\deps\libbstr-6f906671a920827c.rmeta: C:\Users\y\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\bstr-1.12.1\src\lib.rs C:\Users\y\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\bstr-1.12.1\src\ascii.rs C:\Users\y\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\bstr-1.12.1\src\bstr.rs C:\Users\y\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\bstr-1.12.1\src\byteset\mod.rs C:\Users\y\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\bstr-1.12.1\src\byteset\scalar.rs C:\Users\y\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\bstr-1.12.1\src\escape_bytes.rs C:\Users\y\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\bstr-1.12.1\src\ext_slice.rs C:\Users\y\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\bstr-1.12.1\src\impls.rs C:\Users\y\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\bstr-1.12.1\src\utf8.rs
+
+C:\Users\y\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\bstr-1.12.1\src\lib.rs:
+C:\Users\y\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\bstr-1.12.1\src\ascii.rs:
+C:\Users\y\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\bstr-1.12.1\src\bstr.rs:
+C:\Users\y\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\bstr-1.12.1\src\byteset\mod.rs:
+C:\Users\y\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\bstr-1.12.1\src\byteset\scalar.rs:
+C:\Users\y\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\bstr-1.12.1\src\escape_bytes.rs:
+C:\Users\y\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\bstr-1.12.1\src\ext_slice.rs:
+C:\Users\y\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\bstr-1.12.1\src\impls.rs:
+C:\Users\y\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\bstr-1.12.1\src\utf8.rs:

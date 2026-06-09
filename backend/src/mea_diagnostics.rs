@@ -7,12 +7,15 @@ use uuid::Uuid;
 use crate::config::MeaDiagnosticsConfig;
 use crate::models::*;
 
+pub type MEADiagnostics = MEADiagnosticEngine;
+
 #[derive(Debug, Clone)]
 pub struct MEADiagnosticRequest {
     pub electrolyzer_id: u8,
     pub eis_data: Vec<EISDataPoint>,
     pub step_response: StepResponseData,
     pub conductivity_history: Vec<f64>,
+    pub temperature: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -41,11 +44,12 @@ impl MEADiagnosticEngine {
         let _permit = self.semaphore.acquire().await?;
 
         debug!(
-            "Starting MEA diagnosis for electrolyzer {}",
-            request.electrolyzer_id
+            "Starting MEA diagnosis for electrolyzer {}, temperature={:.1}°C",
+            request.electrolyzer_id, request.temperature
         );
 
-        let equivalent_circuit = self.fit_equivalent_circuit(&request.eis_data)?;
+        let mut equivalent_circuit = self.fit_equivalent_circuit(&request.eis_data)?;
+        equivalent_circuit = self.apply_temperature_compensation(equivalent_circuit, request.temperature);
         let step_features = self.analyze_step_response(&request.step_response);
         let conductivity_trend =
             self.calculate_conductivity_trend(&request.conductivity_history);
@@ -151,6 +155,63 @@ impl MEADiagnosticEngine {
         }
 
         Ok(params)
+    }
+
+    pub fn apply_temperature_compensation(
+        &self,
+        mut params: EquivalentCircuitParams,
+        temperature: f64,
+    ) -> EquivalentCircuitParams {
+        let t_ref = self.config.reference_temperature;
+        let t = temperature.clamp(
+            self.config.min_temperature_compensation,
+            self.config.max_temperature_compensation,
+        );
+        let delta_t = t - t_ref;
+
+        let alpha_r = self.config.temperature_coefficient_ohmic;
+        let alpha_ct = self.config.temperature_coefficient_ct;
+        let alpha_dlc = self.config.temperature_coefficient_dlc;
+        let alpha_w = self.config.temperature_coefficient_warburg;
+
+        let compensation_factor_r = 1.0 / (1.0 + alpha_r * delta_t);
+        let compensation_factor_ct = 1.0 / (1.0 + alpha_ct * delta_t);
+        let compensation_factor_dlc = 1.0 / (1.0 + alpha_dlc * delta_t);
+        let compensation_factor_w = 1.0 / (1.0 + alpha_w * delta_t);
+
+        debug!(
+            "Temperature compensation: T={:.1}°C, ΔT={:.1}°C, factors: R_ohm={:.4}, R_ct={:.4}, C_dl={:.4}, W={:.4}",
+            t, delta_t,
+            compensation_factor_r,
+            compensation_factor_ct,
+            compensation_factor_dlc,
+            compensation_factor_w
+        );
+
+        params.ohmic_resistance *= compensation_factor_r;
+        params.charge_transfer_resistance *= compensation_factor_ct;
+        params.double_layer_capacitance *= compensation_factor_dlc;
+        params.warburg_coefficient *= compensation_factor_w;
+
+        params
+    }
+
+    fn calculate_temperature_correction_coefficient(
+        &self,
+        temperature: f64,
+    ) -> f64 {
+        let t_ref = self.config.reference_temperature;
+        let t = temperature.clamp(
+            self.config.min_temperature_compensation,
+            self.config.max_temperature_compensation,
+        );
+        let delta_t = t - t_ref;
+        let activation_energy = 20000.0;
+        let r = 8.314;
+        let t_ref_k = t_ref + 273.15;
+        let t_k = t + 273.15;
+
+        (-activation_energy / r * (1.0 / t_k - 1.0 / t_ref_k)).exp()
     }
 
     fn calculate_fit_error(&self, eis_data: &[EISDataPoint], params: &EquivalentCircuitParams) -> f64 {
@@ -1181,5 +1242,212 @@ mod tests {
 
         assert_eq!(mode, DegradationMode::Normal);
         assert!(confidence < 0.9);
+    }
+
+    #[test]
+    fn test_temperature_compensation_low_temperature() {
+        let config = create_test_config();
+        let (engine, _) = MEADiagnosticEngine::new(config);
+
+        let params = EquivalentCircuitParams {
+            ohmic_resistance: 0.088,
+            charge_transfer_resistance: 0.168,
+            double_layer_capacitance: 0.019,
+            warburg_coefficient: 0.055,
+            fit_error: 0.001,
+        };
+
+        let compensated = engine.apply_temperature_compensation(params.clone(), 20.0);
+
+        assert!(compensated.ohmic_resistance < params.ohmic_resistance);
+        assert!(compensated.charge_transfer_resistance < params.charge_transfer_resistance);
+        assert!(compensated.double_layer_capacitance > params.double_layer_capacitance);
+        assert!(compensated.warburg_coefficient < params.warburg_coefficient);
+
+        assert_relative_eq!(compensated.ohmic_resistance, 0.08, epsilon = 0.01);
+        assert_relative_eq!(compensated.charge_transfer_resistance, 0.15, epsilon = 0.01);
+    }
+
+    #[test]
+    fn test_temperature_compensation_high_temperature() {
+        let config = create_test_config();
+        let (engine, _) = MEADiagnosticEngine::new(config);
+
+        let params = EquivalentCircuitParams {
+            ohmic_resistance: 0.076,
+            charge_transfer_resistance: 0.14,
+            double_layer_capacitance: 0.021,
+            warburg_coefficient: 0.047,
+            fit_error: 0.001,
+        };
+
+        let compensated = engine.apply_temperature_compensation(params.clone(), 80.0);
+
+        assert!(compensated.ohmic_resistance > params.ohmic_resistance);
+        assert!(compensated.charge_transfer_resistance > params.charge_transfer_resistance);
+        assert!(compensated.double_layer_capacitance < params.double_layer_capacitance);
+        assert!(compensated.warburg_coefficient > params.warburg_coefficient);
+
+        assert_relative_eq!(compensated.ohmic_resistance, 0.08, epsilon = 0.01);
+        assert_relative_eq!(compensated.charge_transfer_resistance, 0.15, epsilon = 0.01);
+    }
+
+    #[test]
+    fn test_temperature_compensation_reference_temperature() {
+        let config = create_test_config();
+        let (engine, _) = MEADiagnosticEngine::new(config.clone());
+
+        let params = EquivalentCircuitParams {
+            ohmic_resistance: 0.08,
+            charge_transfer_resistance: 0.15,
+            double_layer_capacitance: 0.02,
+            warburg_coefficient: 0.05,
+            fit_error: 0.001,
+        };
+
+        let compensated = engine.apply_temperature_compensation(params.clone(), config.reference_temperature);
+
+        assert_relative_eq!(compensated.ohmic_resistance, params.ohmic_resistance, epsilon = 1e-6);
+        assert_relative_eq!(compensated.charge_transfer_resistance, params.charge_transfer_resistance, epsilon = 1e-6);
+        assert_relative_eq!(compensated.double_layer_capacitance, params.double_layer_capacitance, epsilon = 1e-6);
+        assert_relative_eq!(compensated.warburg_coefficient, params.warburg_coefficient, epsilon = 1e-6);
+    }
+
+    #[test]
+    fn test_temperature_compensation_clamping() {
+        let config = create_test_config();
+        let (engine, _) = MEADiagnosticEngine::new(config.clone());
+
+        let params = EquivalentCircuitParams {
+            ohmic_resistance: 0.1,
+            charge_transfer_resistance: 0.2,
+            double_layer_capacitance: 0.018,
+            warburg_coefficient: 0.06,
+            fit_error: 0.001,
+        };
+
+        let compensated_low = engine.apply_temperature_compensation(params.clone(), 0.0);
+        let compensated_high = engine.apply_temperature_compensation(params.clone(), 100.0);
+
+        let expected_low = engine.apply_temperature_compensation(params.clone(), config.min_temperature_compensation);
+        let expected_high = engine.apply_temperature_compensation(params.clone(), config.max_temperature_compensation);
+
+        assert_relative_eq!(compensated_low.ohmic_resistance, expected_low.ohmic_resistance, epsilon = 1e-6);
+        assert_relative_eq!(compensated_high.ohmic_resistance, expected_high.ohmic_resistance, epsilon = 1e-6);
+    }
+
+    #[test]
+    fn test_temperature_compensation_with_eis_fit() {
+        let config = create_test_config();
+        let (engine, _) = MEADiagnosticEngine::new(config.clone());
+
+        let base_params = EquivalentCircuitParams {
+            ohmic_resistance: 0.08,
+            charge_transfer_resistance: 0.15,
+            double_layer_capacitance: 0.02,
+            warburg_coefficient: 0.05,
+            fit_error: 0.0,
+        };
+
+        let eis_data = generate_test_eis_data(&base_params, 0.0001);
+
+        let mut time_points = Vec::new();
+        let mut voltage_points = Vec::new();
+        for i in 0..150 {
+            let t = i as f64 * 0.01;
+            let v = if t < 0.5 {
+                1.6
+            } else {
+                1.6 + 0.2 * (1.0 - (- (t - 0.5) / 0.15).exp())
+            };
+            time_points.push(t);
+            voltage_points.push(v);
+        }
+
+        let step_response = StepResponseData {
+            time_points,
+            voltage_points,
+            current_step: 0.5,
+        };
+
+        let conductivity_history: Vec<f64> = (0..30).map(|i| 90.0 - i as f64 * 0.1).collect();
+
+        let request = MEADiagnosticRequest {
+            electrolyzer_id: 1,
+            eis_data: eis_data.clone(),
+            step_response: step_response.clone(),
+            conductivity_history: conductivity_history.clone(),
+            temperature: 20.0,
+        };
+
+        let result = engine.run_diagnosis(request).await.unwrap();
+
+        assert!(result.equivalent_circuit.ohmic_resistance < 0.088);
+        assert!(result.equivalent_circuit.charge_transfer_resistance < 0.168);
+    }
+
+    #[test]
+    fn test_temperature_correction_coefficient() {
+        let config = create_test_config();
+        let (engine, _) = MEADiagnosticEngine::new(config);
+
+        let coeff_20 = engine.calculate_temperature_correction_coefficient(20.0);
+        let coeff_60 = engine.calculate_temperature_correction_coefficient(60.0);
+        let coeff_80 = engine.calculate_temperature_correction_coefficient(80.0);
+
+        assert!(coeff_20 > 1.0);
+        assert_relative_eq!(coeff_60, 1.0, epsilon = 0.01);
+        assert!(coeff_80 < 1.0);
+        assert!(coeff_20 > coeff_80);
+    }
+
+    #[test]
+    fn test_low_temperature_diagnosis_accuracy() {
+        let config = create_test_config();
+        let (engine, _) = MEADiagnosticEngine::new(config);
+
+        let dryout_params_60c = EquivalentCircuitParams {
+            ohmic_resistance: 0.08,
+            charge_transfer_resistance: 0.15,
+            double_layer_capacitance: 0.02,
+            warburg_coefficient: 0.15,
+            fit_error: 0.0,
+        };
+
+        let eis_data = generate_test_eis_data(&dryout_params_60c, 0.0001);
+
+        let mut time_points = Vec::new();
+        let mut voltage_points = Vec::new();
+        for i in 0..150 {
+            let t = i as f64 * 0.01;
+            let v = if t < 0.5 {
+                1.6
+            } else {
+                1.6 + 0.2 * (1.0 - (- (t - 0.5) / 0.15).exp())
+            };
+            time_points.push(t);
+            voltage_points.push(v);
+        }
+
+        let step_response = StepResponseData {
+            time_points,
+            voltage_points,
+            current_step: 0.5,
+        };
+
+        let conductivity_history: Vec<f64> = (0..30).map(|i| 90.0 - i as f64 * 0.5).collect();
+
+        let request_20c = MEADiagnosticRequest {
+            electrolyzer_id: 1,
+            eis_data: eis_data.clone(),
+            step_response: step_response.clone(),
+            conductivity_history: conductivity_history.clone(),
+            temperature: 20.0,
+        };
+
+        let result_20c = engine.run_diagnosis(request_20c).await.unwrap();
+
+        assert_eq!(result_20c.degradation_mode, DegradationMode::MembraneDryout);
+        assert!(result_20c.confidence > 0.7);
     }
 }

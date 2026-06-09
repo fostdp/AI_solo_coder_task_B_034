@@ -1,0 +1,12 @@
+D:\SOLO-2\AI_solo_coder_task_B_034\backend\target\debug\deps\lz4_flex-15eac11bec96e24a.d: C:\Users\y\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\lz4_flex-0.11.6\src\lib.rs C:\Users\y\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\lz4_flex-0.11.6\src\block\mod.rs C:\Users\y\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\lz4_flex-0.11.6\src\block\compress.rs C:\Users\y\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\lz4_flex-0.11.6\src\block\hashtable.rs C:\Users\y\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\lz4_flex-0.11.6\src\block\decompress.rs C:\Users\y\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\lz4_flex-0.11.6\src\fastcpy.rs C:\Users\y\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\lz4_flex-0.11.6\src\fastcpy_unsafe.rs C:\Users\y\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\lz4_flex-0.11.6\src\sink.rs
+
+D:\SOLO-2\AI_solo_coder_task_B_034\backend\target\debug\deps\liblz4_flex-15eac11bec96e24a.rmeta: C:\Users\y\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\lz4_flex-0.11.6\src\lib.rs C:\Users\y\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\lz4_flex-0.11.6\src\block\mod.rs C:\Users\y\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\lz4_flex-0.11.6\src\block\compress.rs C:\Users\y\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\lz4_flex-0.11.6\src\block\hashtable.rs C:\Users\y\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\lz4_flex-0.11.6\src\block\decompress.rs C:\Users\y\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\lz4_flex-0.11.6\src\fastcpy.rs C:\Users\y\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\lz4_flex-0.11.6\src\fastcpy_unsafe.rs C:\Users\y\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\lz4_flex-0.11.6\src\sink.rs
+
+C:\Users\y\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\lz4_flex-0.11.6\src\lib.rs:
+C:\Users\y\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\lz4_flex-0.11.6\src\block\mod.rs:
+C:\Users\y\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\lz4_flex-0.11.6\src\block\compress.rs:
+C:\Users\y\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\lz4_flex-0.11.6\src\block\hashtable.rs:
+C:\Users\y\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\lz4_flex-0.11.6\src\block\decompress.rs:
+C:\Users\y\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\lz4_flex-0.11.6\src\fastcpy.rs:
+C:\Users\y\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\lz4_flex-0.11.6\src\fastcpy_unsafe.rs:
+C:\Users\y\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\lz4_flex-0.11.6\src\sink.rs:

@@ -56,9 +56,31 @@ impl HydrogenLeakDetector {
 
         let mut leaks = Vec::new();
 
-        let mut sensor_features = Vec::new();
+        let mut processed_data = Vec::new();
         for data in &request.acoustic_data {
-            let features = self.calculate_spectral_features(data)?;
+            let filtered_signal = self.adaptive_filter(&data.signal);
+            let noise_estimate = self.estimate_noise_floor(&data.signal);
+            let snr = self.calculate_snr(&filtered_signal, noise_estimate);
+
+            debug!(
+                "Sensor {}: SNR={:.1} dB, noise_floor={:.6}",
+                data.sensor_id, snr, noise_estimate
+            );
+
+            processed_data.push((data.clone(), filtered_signal, noise_estimate, snr));
+        }
+
+        let mut sensor_features = Vec::new();
+        for (data, filtered_signal, noise_estimate, snr) in &processed_data {
+            if self.config.snr_based_weighting && *snr < self.config.min_snr_threshold {
+                debug!(
+                    "Sensor {} SNR {:.1} dB below threshold {:.1} dB, skipping",
+                    data.sensor_id, snr, self.config.min_snr_threshold
+                );
+                continue;
+            }
+
+            let mut features = self.calculate_spectral_features(data, Some(filtered_signal), *noise_estimate, *snr)?;
             sensor_features.push((data.sensor_id, features));
         }
 
@@ -71,7 +93,7 @@ impl HydrogenLeakDetector {
             .collect();
 
         if active_sensors.len() >= self.config.trilateration_sensor_count {
-            let toa_data: Vec<(u16, f64, f64)> = active_sensors
+            let toa_data: Vec<(u16, f64, f64, f64)> = active_sensors
                 .iter()
                 .map(|(id, f)| {
                     let toa = self.estimate_time_of_arrival(
@@ -81,7 +103,12 @@ impl HydrogenLeakDetector {
                             .find(|d| d.sensor_id == *id)
                             .unwrap(),
                     );
-                    (*id, toa, f.peak_amplitude)
+                    let snr_weight = if self.config.snr_based_weighting {
+                        (f.snr / self.config.min_snr_threshold).min(self.config.max_filter_gain)
+                    } else {
+                        1.0
+                    };
+                    (*id, toa, f.peak_amplitude, snr_weight)
                 })
                 .collect();
 
@@ -110,6 +137,8 @@ impl HydrogenLeakDetector {
                         spectral_centroid: 0.0,
                         kurtosis: 0.0,
                         peak_amplitude: 0.0,
+                        snr: 0.0,
+                        noise_floor: 0.0,
                     });
 
                 let leak = HydrogenLeak {
@@ -225,12 +254,15 @@ impl HydrogenLeakDetector {
     pub fn calculate_spectral_features(
         &self,
         data: &AcousticEmissionData,
+        filtered_signal: Option<&[f64]>,
+        noise_floor: f64,
+        snr: f64,
     ) -> Result<SpectralFeatures, Box<dyn std::error::Error + Send + Sync>> {
         if data.signal.is_empty() {
             return Err("Empty signal data".into());
         }
 
-        let signal = &data.signal;
+        let signal = filtered_signal.unwrap_or(&data.signal);
         let n = signal.len();
 
         let rms = (signal.iter().map(|&x| x * x).sum::<f64>() / n as f64).sqrt();
@@ -248,12 +280,25 @@ impl HydrogenLeakDetector {
             if *freq >= self.config.ultrasound_frequency_min
                 && *freq <= self.config.ultrasound_frequency_max
             {
-                if *mag > max_magnitude {
-                    max_magnitude = *mag;
+                let snr_weight = if self.config.snr_based_weighting {
+                    let freq_snr = if noise_floor > 1e-10 {
+                        20.0 * (mag / noise_floor).log10()
+                    } else {
+                        0.0
+                    };
+                    (freq_snr.max(0.0) / 10.0 + 1.0).min(self.config.max_filter_gain)
+                } else {
+                    1.0
+                };
+
+                let weighted_mag = mag * snr_weight;
+
+                if weighted_mag > max_magnitude {
+                    max_magnitude = weighted_mag;
                     peak_freq = *freq;
                 }
-                weighted_sum += freq * mag;
-                total_magnitude += mag;
+                weighted_sum += freq * weighted_mag;
+                total_magnitude += weighted_mag;
             }
         }
 
@@ -286,7 +331,79 @@ impl HydrogenLeakDetector {
             spectral_centroid: spectral_centroid * data.sampling_rate,
             kurtosis,
             peak_amplitude,
+            snr,
+            noise_floor,
         })
+    }
+
+    pub fn adaptive_filter(&self, signal: &[f64]) -> Vec<f64> {
+        let order = self.config.adaptive_filter_order;
+        let mu = self.config.adaptive_filter_mu;
+        let n = signal.len();
+
+        if n <= order {
+            return signal.to_vec();
+        }
+
+        let mut output = vec![0.0; n];
+        let mut weights = vec![0.0; order];
+
+        for i in 0..order {
+            output[i] = signal[i];
+        }
+
+        for i in order..n {
+            let mut prediction = 0.0;
+            for j in 0..order {
+                prediction += weights[j] * signal[i - j - 1];
+            }
+
+            let error = signal[i] - prediction;
+            output[i] = error;
+
+            for j in 0..order {
+                weights[j] += mu * error * signal[i - j - 1];
+                weights[j] = weights[j].clamp(-10.0, 10.0);
+            }
+        }
+
+        output
+    }
+
+    pub fn estimate_noise_floor(&self, signal: &[f64]) -> f64 {
+        let window_size = self.config.noise_estimation_window.min(signal.len());
+        if window_size == 0 {
+            return 0.0;
+        }
+
+        let mut rms_values = Vec::new();
+        let step = window_size / 2;
+
+        let mut i = 0;
+        while i + window_size <= signal.len() {
+            let mut sum_sq = 0.0;
+            for j in 0..window_size {
+                sum_sq += signal[i + j] * signal[i + j];
+            }
+            rms_values.push((sum_sq / window_size as f64).sqrt());
+            i += step;
+        }
+
+        rms_values.sort_by(|a, b| a.partial_cmp(b).unwrap());
+
+        let percentile_idx = (rms_values.len() as f64 * 0.1) as usize;
+        rms_values[percentile_idx.min(rms_values.len() - 1)]
+    }
+
+    pub fn calculate_snr(&self, signal: &[f64], noise_floor: f64) -> f64 {
+        if noise_floor < 1e-10 || signal.is_empty() {
+            return 0.0;
+        }
+
+        let signal_rms = (signal.iter().map(|&x| x * x).sum::<f64>() / signal.len() as f64).sqrt();
+        let noise_rms = noise_floor.max(1e-10);
+
+        20.0 * (signal_rms / noise_rms).log10()
     }
 
     fn estimate_time_of_arrival(&self, data: &AcousticEmissionData) -> f64 {
@@ -305,7 +422,7 @@ impl HydrogenLeakDetector {
 
     pub fn trilaterate_leak_position(
         &self,
-        toa_data: &[(u16, f64, f64)],
+        toa_data: &[(u16, f64, f64, f64)],
         sensor_positions: &[SensorPosition],
     ) -> Result<LeakLocation, Box<dyn std::error::Error + Send + Sync>> {
         if toa_data.len() < 3 {
@@ -315,14 +432,14 @@ impl HydrogenLeakDetector {
         let reference_toa = toa_data
             .iter()
             .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
-            .map(|&(_, t, _)| t)
+            .map(|&(_, t, _, _)| t)
             .unwrap_or(0.0);
 
         let mut time_differences = Vec::new();
-        for (sensor_id, toa, amplitude) in toa_data {
+        for (sensor_id, toa, amplitude, snr_weight) in toa_data {
             let td = toa - reference_toa;
             if let Some(pos) = sensor_positions.iter().find(|p| p.sensor_id == *sensor_id) {
-                time_differences.push((pos, td, amplitude));
+                time_differences.push((pos, td, amplitude, snr_weight));
             }
         }
 
@@ -336,13 +453,14 @@ impl HydrogenLeakDetector {
         let sound_speed = self.config.sound_speed_hydrogen;
 
         let mut total_weight = 0.0;
-        for (pos, td, amplitude) in &time_differences {
+        for (pos, td, amplitude, snr_weight) in &time_differences {
             let distance = td * sound_speed;
-            let weight = amplitude / (1.0 + distance);
-            x += pos.x * weight;
-            y += pos.y * weight;
-            z += pos.z * weight;
-            total_weight += weight;
+            let base_weight = amplitude / (1.0 + distance);
+            let combined_weight = base_weight * snr_weight;
+            x += pos.x * combined_weight;
+            y += pos.y * combined_weight;
+            z += pos.z * combined_weight;
+            total_weight += combined_weight;
         }
 
         if total_weight > 0.0 {
@@ -353,14 +471,15 @@ impl HydrogenLeakDetector {
 
         let mut error_sum = 0.0;
         let mut count = 0.0;
-        for (pos, td, _) in &time_differences {
+        for (pos, td, _, snr_weight) in &time_differences {
             let dx = x - pos.x;
             let dy = y - pos.y;
             let dz = z - pos.z;
             let distance = (dx * dx + dy * dy + dz * dz).sqrt();
             let expected_td = distance / sound_speed;
-            error_sum += (td - expected_td).abs();
-            count += 1.0;
+            let weighted_error = (td - expected_td).abs() * snr_weight;
+            error_sum += weighted_error;
+            count += snr_weight;
         }
 
         let uncertainty = if count > 0.0 {
@@ -484,6 +603,12 @@ mod tests {
             min_leak_rate: 0.001,
             detection_interval_secs: 10,
             max_concurrent_detections: 5,
+            adaptive_filter_order: 8,
+            adaptive_filter_mu: 0.01,
+            min_snr_threshold: 3.0,
+            noise_estimation_window: 100,
+            max_filter_gain: 10.0,
+            snr_based_weighting: true,
         }
     }
 
@@ -608,7 +733,9 @@ mod tests {
             sampling_rate: 100000.0,
         };
 
-        let features = detector.calculate_spectral_features(&data).unwrap();
+        let noise_floor = detector.estimate_noise_floor(&data.signal);
+        let snr = detector.calculate_snr(&data.signal, noise_floor);
+        let features = detector.calculate_spectral_features(&data, Some(&data.signal), noise_floor, snr).unwrap();
 
         assert!(features.rms > 0.0);
         assert!(features.rms < 0.2);
@@ -650,7 +777,9 @@ mod tests {
             sampling_rate: 100000.0,
         };
 
-        let features = detector.calculate_spectral_features(&data).unwrap();
+        let noise_floor = detector.estimate_noise_floor(&data.signal);
+        let snr = detector.calculate_snr(&data.signal, noise_floor);
+        let features = detector.calculate_spectral_features(&data, Some(&data.signal), noise_floor, snr).unwrap();
 
         assert!(features.rms < 0.001);
         assert!(features.peak_amplitude < 0.001);
@@ -681,7 +810,7 @@ mod tests {
             let dz = leak_z - pos.z;
             let distance = (dx * dx + dy * dy + dz * dz).sqrt();
             let toa = distance / sound_speed;
-            toa_data.push((pos.sensor_id, toa, 0.5 + i as f64 * 0.1));
+            toa_data.push((pos.sensor_id, toa, 0.5 + i as f64 * 0.1, 1.0));
         }
 
         let location = detector
@@ -703,7 +832,7 @@ mod tests {
             SensorPosition { sensor_id: 2, x: 1.0, y: 0.0, z: 0.0 },
         ];
 
-        let toa_data = vec![(1, 0.0, 0.5), (2, 0.001, 0.4)];
+        let toa_data = vec![(1, 0.0, 0.5, 1.0), (2, 0.001, 0.4, 1.0)];
 
         let result = detector.trilaterate_leak_position(&toa_data, &sensor_positions);
         assert!(result.is_err());
@@ -718,7 +847,7 @@ mod tests {
             SensorPosition { sensor_id: 1, x: 0.0, y: 0.0, z: 0.0 },
         ];
 
-        let toa_data = vec![(1, 0.0, 0.5), (99, 0.001, 0.4), (100, 0.002, 0.3)];
+        let toa_data = vec![(1, 0.0, 0.5, 1.0), (99, 0.001, 0.4, 1.0), (100, 0.002, 0.3, 1.0)];
 
         let result = detector.trilaterate_leak_position(&toa_data, &sensor_positions);
         assert!(result.is_err());
@@ -997,6 +1126,8 @@ mod tests {
                 spectral_centroid: 45000.0,
                 kurtosis: 2.0,
                 peak_amplitude: 0.15,
+                snr: 10.0,
+                noise_floor: 0.005,
             },
             acknowledged: false,
             resolved: false,
@@ -1046,5 +1177,273 @@ mod tests {
         assert_eq!(result.len(), 1);
         assert_relative_eq!(result[0].0, 42.0, epsilon = 1e-10);
         assert_relative_eq!(result[0].1, 0.0, epsilon = 1e-10);
+    }
+
+    #[test]
+    fn test_adaptive_filter_basic() {
+        let config = create_test_config();
+        let (detector, _) = HydrogenLeakDetector::new(config);
+
+        let n = 200;
+        let signal: Vec<f64> = (0..n)
+            .map(|i| {
+                let t = i as f64 * 0.01;
+                (2.0 * std::f64::consts::PI * 50.0 * t).sin()
+                    + (rand::random::<f64>() - 0.5) * 0.5
+            })
+            .collect();
+
+        let filtered = detector.adaptive_filter(&signal);
+
+        assert_eq!(filtered.len(), signal.len());
+
+        let input_power: f64 = signal.iter().map(|&x| x * x).sum();
+        let output_power: f64 = filtered.iter().map(|&x| x * x).sum();
+
+        assert!(output_power < input_power * 1.5);
+        assert!(output_power > 0.0);
+    }
+
+    #[test]
+    fn test_adaptive_filter_short_signal() {
+        let config = create_test_config();
+        let (detector, _) = HydrogenLeakDetector::new(config);
+
+        let signal = vec![1.0, 2.0, 3.0];
+        let filtered = detector.adaptive_filter(&signal);
+
+        assert_eq!(filtered.len(), signal.len());
+        assert_relative_eq!(filtered[0], 1.0, epsilon = 1e-10);
+        assert_relative_eq!(filtered[1], 2.0, epsilon = 1e-10);
+        assert_relative_eq!(filtered[2], 3.0, epsilon = 1e-10);
+    }
+
+    #[test]
+    fn test_estimate_noise_floor() {
+        let config = create_test_config();
+        let (detector, _) = HydrogenLeakDetector::new(config);
+
+        let noise_level = 0.01;
+        let signal: Vec<f64> = (0..500)
+            .map(|_| (rand::random::<f64>() - 0.5) * 2.0 * noise_level)
+            .collect();
+
+        let noise_floor = detector.estimate_noise_floor(&signal);
+
+        assert!(noise_floor > 0.0);
+        assert!(noise_floor < noise_level * 2.0);
+    }
+
+    #[test]
+    fn test_estimate_noise_floor_with_signal() {
+        let config = create_test_config();
+        let (detector, _) = HydrogenLeakDetector::new(config);
+
+        let noise_level = 0.01;
+        let signal: Vec<f64> = (0..500)
+            .map(|i| {
+                let t = i as f64 * 0.001;
+                let sine = if i > 200 && i < 300 {
+                    0.1 * (2.0 * std::f64::consts::PI * 500.0 * t).sin()
+                } else {
+                    0.0
+                };
+                sine + (rand::random::<f64>() - 0.5) * 2.0 * noise_level
+            })
+            .collect();
+
+        let noise_floor = detector.estimate_noise_floor(&signal);
+
+        assert!(noise_floor > 0.0);
+        assert!(noise_floor < noise_level * 3.0);
+    }
+
+    #[test]
+    fn test_calculate_snr_high() {
+        let config = create_test_config();
+        let (detector, _) = HydrogenLeakDetector::new(config);
+
+        let signal: Vec<f64> = (0..100)
+            .map(|i| (i as f64 * 0.1).sin() + (rand::random::<f64>() - 0.5) * 0.01)
+            .collect();
+
+        let noise_floor = 0.01;
+        let snr = detector.calculate_snr(&signal, noise_floor);
+
+        assert!(snr > 10.0);
+    }
+
+    #[test]
+    fn test_calculate_snr_low() {
+        let config = create_test_config();
+        let (detector, _) = HydrogenLeakDetector::new(config);
+
+        let signal: Vec<f64> = (0..100)
+            .map(|_| (rand::random::<f64>() - 0.5) * 0.02)
+            .collect();
+
+        let noise_floor = 0.01;
+        let snr = detector.calculate_snr(&signal, noise_floor);
+
+        assert!(snr < 10.0);
+    }
+
+    #[test]
+    fn test_calculate_snr_edge_cases() {
+        let config = create_test_config();
+        let (detector, _) = HydrogenLeakDetector::new(config);
+
+        let empty: Vec<f64> = Vec::new();
+        assert_relative_eq!(detector.calculate_snr(&empty, 0.01), 0.0, epsilon = 1e-10);
+        assert_relative_eq!(detector.calculate_snr(&[1.0, 2.0], 0.0), 0.0, epsilon = 1e-10);
+    }
+
+    #[test]
+    fn test_trilateration_with_snr_weights() {
+        let config = create_test_config();
+        let (detector, _) = HydrogenLeakDetector::new(config);
+
+        let sensor_positions = vec![
+            SensorPosition { sensor_id: 1, x: 0.0, y: 0.0, z: 0.0 },
+            SensorPosition { sensor_id: 2, x: 1.0, y: 0.0, z: 0.0 },
+            SensorPosition { sensor_id: 3, x: 0.5, y: 1.0, z: 0.0 },
+        ];
+
+        let leak_x = 0.3;
+        let leak_y = 0.4;
+        let leak_z = 0.0;
+        let sound_speed = config.sound_speed_hydrogen;
+
+        let toa_data = vec![
+            (1, 0.0, 0.5, 10.0),
+            (2, (0.7_f64.hypot(0.4)) / sound_speed, 0.4, 10.0),
+            (3, (0.2_f64.hypot(0.6)) / sound_speed, 0.6, 0.1),
+        ];
+
+        let location = detector
+            .trilaterate_leak_position(&toa_data, &sensor_positions)
+            .unwrap();
+
+        assert!(location.x > 0.0 && location.x < 1.0);
+        assert!(location.y > 0.0 && location.y < 1.0);
+        assert!(location.uncertainty > 0.0);
+    }
+
+    #[tokio::test]
+    async fn test_detect_leaks_high_noise_with_filtering() {
+        let mut config = create_test_config();
+        config.snr_based_weighting = true;
+        config.min_snr_threshold = 2.0;
+        let (detector, _rx) = HydrogenLeakDetector::new(config.clone());
+
+        let sensor_positions = vec![
+            SensorPosition { sensor_id: 1, x: 0.0, y: 0.0, z: 0.0 },
+            SensorPosition { sensor_id: 2, x: 1.0, y: 0.0, z: 0.0 },
+            SensorPosition { sensor_id: 3, x: 0.5, y: 1.0, z: 0.0 },
+            SensorPosition { sensor_id: 4, x: 0.0, y: 1.0, z: 0.0 },
+        ];
+
+        let leak_x = 0.4;
+        let leak_y = 0.5;
+        let leak_z = 0.0;
+        let sound_speed = config.sound_speed_hydrogen;
+
+        let mut acoustic_data = Vec::new();
+        for (i, pos) in sensor_positions.iter().enumerate() {
+            let dx = leak_x - pos.x;
+            let dy = leak_y - pos.y;
+            let dz = leak_z - pos.z;
+            let distance = (dx * dx + dy * dy + dz * dz).sqrt();
+            let delay = distance / sound_speed;
+            let amplitude = 0.3 / (1.0 + distance * 2.0);
+
+            let mut signal = generate_test_leak_signal(0.1, 100000.0, amplitude, delay);
+            for sample in signal.iter_mut() {
+                *sample += (rand::random::<f64>() - 0.5) * 0.05;
+            }
+
+            acoustic_data.push(AcousticEmissionData {
+                sensor_id: pos.sensor_id,
+                timestamp: Utc::now(),
+                signal,
+                sampling_rate: 100000.0,
+            });
+        }
+
+        let request = LeakDetectionRequest {
+            electrolyzer_id: 1,
+            acoustic_data,
+            sensor_positions: sensor_positions.clone(),
+            flow_rate_reference: Some(100.0),
+        };
+
+        let leaks = detector.detect_leaks(request).await.unwrap();
+
+        assert!(!leaks.is_empty());
+        assert!(leaks[0].location.uncertainty < 0.5);
+    }
+
+    #[tokio::test]
+    async fn test_detect_leaks_snr_filtering_removes_low_quality() {
+        let mut config = create_test_config();
+        config.snr_based_weighting = true;
+        config.min_snr_threshold = 20.0;
+        let (detector, _rx) = HydrogenLeakDetector::new(config.clone());
+
+        let sensor_positions = vec![
+            SensorPosition { sensor_id: 1, x: 0.0, y: 0.0, z: 0.0 },
+            SensorPosition { sensor_id: 2, x: 1.0, y: 0.0, z: 0.0 },
+            SensorPosition { sensor_id: 3, x: 0.5, y: 1.0, z: 0.0 },
+        ];
+
+        let mut acoustic_data = Vec::new();
+        for pos in &sensor_positions {
+            let signal: Vec<f64> = (0..1000)
+                .map(|_| (rand::random::<f64>() - 0.5) * 0.01)
+                .collect();
+
+            acoustic_data.push(AcousticEmissionData {
+                sensor_id: pos.sensor_id,
+                timestamp: Utc::now(),
+                signal,
+                sampling_rate: 100000.0,
+            });
+        }
+
+        let request = LeakDetectionRequest {
+            electrolyzer_id: 1,
+            acoustic_data,
+            sensor_positions,
+            flow_rate_reference: None,
+        };
+
+        let leaks = detector.detect_leaks(request).await.unwrap();
+        assert!(leaks.is_empty());
+    }
+
+    #[test]
+    fn test_spectral_features_with_snr() {
+        let config = create_test_config();
+        let (detector, _) = HydrogenLeakDetector::new(config);
+
+        let signal = generate_test_signal(0.1, 100000.0, &[50000.0], &[0.1], 0.001);
+
+        let data = AcousticEmissionData {
+            sensor_id: 1,
+            timestamp: Utc::now(),
+            signal: signal.clone(),
+            sampling_rate: 100000.0,
+        };
+
+        let noise_floor = detector.estimate_noise_floor(&data.signal);
+        let snr = detector.calculate_snr(&data.signal, noise_floor);
+        let features = detector
+            .calculate_spectral_features(&data, Some(&data.signal), noise_floor, snr)
+            .unwrap();
+
+        assert!(features.snr > 0.0);
+        assert!(features.noise_floor > 0.0);
+        assert!(features.snr == snr);
+        assert!(features.noise_floor == noise_floor);
     }
 }

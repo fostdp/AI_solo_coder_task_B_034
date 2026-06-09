@@ -32,6 +32,8 @@ struct MPCStateInternal {
     operating_hours: f64,
     is_running: bool,
     prediction_buffer: VecDeque<f64>,
+    previous_solution: Option<f64>,
+    last_power_change: f64,
 }
 
 impl MPCController {
@@ -46,6 +48,8 @@ impl MPCController {
             operating_hours: 0.0,
             is_running: false,
             prediction_buffer: VecDeque::with_capacity(50),
+            previous_solution: None,
+            last_power_change: 0.0,
         };
 
         let controller = Self {
@@ -86,15 +90,49 @@ impl MPCController {
         let deadzone = self.config.deadzone_percentage / 100.0 * self.config.max_power_kw;
         let power_deviation = (request.current_power - target_power).abs();
 
+        state.last_power_change = power_deviation;
+
+        let use_approximate = self.config.approximate_solve_enabled
+            && power_deviation > self.config.power_change_threshold;
+
         let mut control_signal = if power_deviation <= deadzone {
             request.current_power
+        } else if use_approximate {
+            debug!(
+                "Power change {:.2} kW exceeds threshold {:.2} kW, using approximate solve",
+                power_deviation, self.config.power_change_threshold
+            );
+            self.approximate_solve(
+                request.current_power,
+                target_power,
+                state.previous_solution,
+            )
         } else {
-            self.solve_mpc(
+            let start_time = std::time::Instant::now();
+            let result = self.solve_mpc(
                 request.current_power,
                 target_power,
                 &state.prediction_buffer.iter().cloned().collect::<Vec<_>>(),
-            )
+                state.previous_solution,
+            );
+
+            let elapsed = start_time.elapsed();
+            if elapsed.as_micros() as u64 > self.config.mpc_solve_timeout_us {
+                warn!(
+                    "MPC solve timed out after {:?}, falling back to approximate",
+                    elapsed
+                );
+                self.approximate_solve(
+                    request.current_power,
+                    target_power,
+                    state.previous_solution,
+                )
+            } else {
+                result
+            }
         };
+
+        state.previous_solution = Some(control_signal);
 
         let current_time = Utc::now().timestamp() as f64;
 
@@ -270,23 +308,39 @@ impl MPCController {
         current_power: f64,
         target_power: f64,
         predictions: &[f64],
+        previous_solution: Option<f64>,
     ) -> f64 {
         let horizon = self.config.mpc_horizon as usize;
         let control_weight = self.config.mpc_control_weight;
         let rate_weight = self.config.mpc_rate_weight;
+        let max_iterations = self.config.mpc_max_iterations as usize;
 
         let mut best_control = current_power;
         let mut min_cost = f64::INFINITY;
 
         let search_range = (self.config.max_power_kw - self.config.min_power_kw) * 0.5;
-        let center = target_power.clamp(
-            current_power - search_range,
-            current_power + search_range,
-        );
-        let step = search_range / 20.0;
+        let center = if self.config.hot_start_enabled && previous_solution.is_some() {
+            let prev = previous_solution.unwrap();
+            let warm_start_center = prev * self.config.warm_start_gain
+                + target_power * (1.0 - self.config.warm_start_gain);
+            warm_start_center.clamp(
+                current_power - search_range,
+                current_power + search_range,
+            )
+        } else {
+            target_power.clamp(
+                current_power - search_range,
+                current_power + search_range,
+            )
+        };
+
+        let step = search_range / max_iterations.max(1) as f64;
 
         let mut u = (center - search_range).max(self.config.min_power_kw);
-        while u <= (center + search_range).min(self.config.max_power_kw) {
+        let mut iteration = 0;
+        while u <= (center + search_range).min(self.config.max_power_kw)
+            && iteration < max_iterations
+        {
             let mut cost = 0.0;
             let mut prev_power = current_power;
 
@@ -308,9 +362,33 @@ impl MPCController {
             }
 
             u += step;
+            iteration += 1;
         }
 
         best_control
+    }
+
+    pub fn approximate_solve(
+        &self,
+        current_power: f64,
+        target_power: f64,
+        previous_solution: Option<f64>,
+    ) -> f64 {
+        let ramp_rate = self.config.power_ramp_rate_per_sec * self.config.control_interval_secs as f64;
+        let max_delta = ramp_rate * self.config.approximate_solve_threshold;
+
+        let base_target = if self.config.hot_start_enabled && previous_solution.is_some() {
+            let prev = previous_solution.unwrap();
+            prev * self.config.warm_start_gain + target_power * (1.0 - self.config.warm_start_gain)
+        } else {
+            target_power
+        };
+
+        let delta = base_target - current_power;
+        let clamped_delta = delta.clamp(-max_delta, max_delta);
+        let approximate = current_power + clamped_delta;
+
+        approximate.clamp(self.config.min_power_kw, self.config.max_power_kw)
     }
 
     pub fn power_to_current_density(&self, power: f64) -> f64 {
@@ -352,6 +430,8 @@ impl MPCController {
         state.operating_hours = 0.0;
         state.is_running = false;
         state.prediction_buffer.clear();
+        state.previous_solution = None;
+        state.last_power_change = 0.0;
     }
 }
 
@@ -372,6 +452,13 @@ mod tests {
             control_interval_secs: 5,
             max_power_kw: 100.0,
             min_power_kw: 10.0,
+            mpc_max_iterations: 100,
+            mpc_solve_timeout_us: 1000000,
+            hot_start_enabled: true,
+            approximate_solve_enabled: true,
+            approximate_solve_threshold: 0.1,
+            power_change_threshold: 20.0,
+            warm_start_gain: 0.8,
         }
     }
 
@@ -482,7 +569,7 @@ mod tests {
         let target_power = 60.0;
         let predictions = vec![60.0; 10];
 
-        let optimal_power = controller.solve_mpc(current_power, target_power, &predictions);
+        let optimal_power = controller.solve_mpc(current_power, target_power, &predictions, None);
 
         assert!(optimal_power > current_power);
         assert!(optimal_power <= target_power + 5.0);
@@ -499,7 +586,7 @@ mod tests {
         let target_power = 80.0;
         let predictions = vec![80.0; 10];
 
-        let optimal_power = controller.solve_mpc(current_power, target_power, &predictions);
+        let optimal_power = controller.solve_mpc(current_power, target_power, &predictions, None);
 
         assert!(optimal_power < target_power);
         assert!(optimal_power > current_power);
@@ -514,7 +601,7 @@ mod tests {
         let target_power = 200.0;
         let predictions = vec![200.0; 10];
 
-        let optimal_power = controller.solve_mpc(current_power, target_power, &predictions);
+        let optimal_power = controller.solve_mpc(current_power, target_power, &predictions, None);
 
         assert!(optimal_power <= config.max_power_kw);
         assert!(optimal_power >= config.min_power_kw);
@@ -820,7 +907,7 @@ mod tests {
         let target_power = 60.0;
         let predictions = Vec::new();
 
-        let optimal_power = controller.solve_mpc(current_power, target_power, &predictions);
+        let optimal_power = controller.solve_mpc(current_power, target_power, &predictions, None);
 
         assert!(optimal_power > 0.0);
         assert!(optimal_power <= config.max_power_kw);
@@ -889,5 +976,211 @@ mod tests {
         }
 
         assert!(start_stop_count <= 3);
+    }
+
+    #[test]
+    fn test_hot_start_with_previous_solution() {
+        let mut config = create_test_config();
+        config.hot_start_enabled = true;
+        let (controller, _) = MPCController::new(config);
+
+        let current_power = 40.0;
+        let target_power = 60.0;
+        let predictions = vec![60.0; 10];
+
+        let result_cold = controller.solve_mpc(current_power, target_power, &predictions, None);
+        let result_hot = controller.solve_mpc(current_power, target_power, &predictions, Some(55.0));
+
+        assert!(result_hot > current_power);
+        assert!(result_hot <= config.max_power_kw);
+    }
+
+    #[test]
+    fn test_hot_start_disabled() {
+        let mut config = create_test_config();
+        config.hot_start_enabled = false;
+        let (controller, _) = MPCController::new(config);
+
+        let current_power = 40.0;
+        let target_power = 60.0;
+        let predictions = vec![60.0; 10];
+
+        let result1 = controller.solve_mpc(current_power, target_power, &predictions, Some(55.0));
+        let result2 = controller.solve_mpc(current_power, target_power, &predictions, None);
+
+        assert_relative_eq!(result1, result2, epsilon = 1.0);
+    }
+
+    #[test]
+    fn test_approximate_solve_basic() {
+        let config = create_test_config();
+        let (controller, _) = MPCController::new(config);
+
+        let current_power = 40.0;
+        let target_power = 80.0;
+
+        let result = controller.approximate_solve(current_power, target_power, None);
+
+        assert!(result > current_power);
+        assert!(result <= config.max_power_kw);
+        assert!(result >= config.min_power_kw);
+    }
+
+    #[test]
+    fn test_approximate_solve_with_hot_start() {
+        let mut config = create_test_config();
+        config.hot_start_enabled = true;
+        let (controller, _) = MPCController::new(config);
+
+        let current_power = 40.0;
+        let target_power = 80.0;
+        let previous = 50.0;
+
+        let result_with_prev = controller.approximate_solve(current_power, target_power, Some(previous));
+        let result_without_prev = controller.approximate_solve(current_power, target_power, None);
+
+        assert!(result_with_prev > current_power);
+        assert!(result_without_prev > current_power);
+    }
+
+    #[test]
+    fn test_approximate_solve_ramp_limited() {
+        let mut config = create_test_config();
+        config.power_ramp_rate_per_sec = 0.001;
+        config.control_interval_secs = 5;
+        let (controller, _) = MPCController::new(config);
+
+        let current_power = 40.0;
+        let target_power = 100.0;
+
+        let result = controller.approximate_solve(current_power, target_power, None);
+
+        let max_delta = config.power_ramp_rate_per_sec
+            * config.control_interval_secs as f64
+            * config.approximate_solve_threshold;
+        assert!(result <= current_power + max_delta + 0.1);
+    }
+
+    #[test]
+    fn test_mpc_max_iterations() {
+        let mut config = create_test_config();
+        config.mpc_max_iterations = 5;
+        let (controller, _) = MPCController::new(config);
+
+        let current_power = 40.0;
+        let target_power = 60.0;
+        let predictions = vec![60.0; 10];
+
+        let start = std::time::Instant::now();
+        let result = controller.solve_mpc(current_power, target_power, &predictions, None);
+        let elapsed = start.elapsed();
+
+        assert!(result > 0.0);
+        assert!(result <= config.max_power_kw);
+        assert!(elapsed < std::time::Duration::from_millis(100));
+    }
+
+    #[tokio::test]
+    async fn test_large_power_change_triggers_approximate() {
+        let mut config = create_test_config();
+        config.power_change_threshold = 10.0;
+        config.approximate_solve_enabled = true;
+        let (controller, _rx) = MPCController::new(config.clone());
+
+        controller.reset().await;
+
+        let request1 = RenewableCouplingRequest {
+            electrolyzer_id: 1,
+            renewable_power: 30.0,
+            grid_power_available: 100.0,
+            current_power: 0.0,
+            current_density: 0.0,
+            power_history: vec![30.0; 20],
+        };
+        controller.update_control(request1).await.unwrap();
+
+        let request2 = RenewableCouplingRequest {
+            electrolyzer_id: 1,
+            renewable_power: 80.0,
+            grid_power_available: 100.0,
+            current_power: 30.0,
+            current_density: 166.0,
+            power_history: vec![30.0; 20],
+        };
+        let result = controller.update_control(request2).await.unwrap();
+
+        assert!(result.actual_power > 30.0);
+        assert!(result.actual_power <= config.max_power_kw);
+    }
+
+    #[tokio::test]
+    async fn test_previous_solution_stored() {
+        let config = create_test_config();
+        let (controller, _rx) = MPCController::new(config.clone());
+
+        controller.reset().await;
+
+        let request1 = RenewableCouplingRequest {
+            electrolyzer_id: 1,
+            renewable_power: 50.0,
+            grid_power_available: 100.0,
+            current_power: 0.0,
+            current_density: 0.0,
+            power_history: vec![50.0; 20],
+        };
+        let result1 = controller.update_control(request1).await.unwrap();
+
+        let request2 = RenewableCouplingRequest {
+            electrolyzer_id: 1,
+            renewable_power: 55.0,
+            grid_power_available: 100.0,
+            current_power: result1.actual_power,
+            current_density: result1.current_density,
+            power_history: vec![50.0; 20],
+        };
+        let result2 = controller.update_control(request2).await.unwrap();
+
+        assert!(result2.actual_power > 0.0);
+        assert!(result2.tracking_error < 20.0);
+    }
+
+    #[test]
+    fn test_approximate_solve_bounds() {
+        let config = create_test_config();
+        let (controller, _) = MPCController::new(config);
+
+        let result_low = controller.approximate_solve(5.0, 5.0, None);
+        assert!(result_low >= config.min_power_kw || result_low == 0.0);
+
+        let result_high = controller.approximate_solve(150.0, 150.0, None);
+        assert!(result_high <= config.max_power_kw);
+    }
+
+    #[tokio::test]
+    async fn test_reset_clears_previous_solution() {
+        let config = create_test_config();
+        let (controller, _rx) = MPCController::new(config);
+
+        controller.reset().await;
+
+        let request1 = RenewableCouplingRequest {
+            electrolyzer_id: 1,
+            renewable_power: 50.0,
+            grid_power_available: 100.0,
+            current_power: 0.0,
+            current_density: 0.0,
+            power_history: vec![50.0; 20],
+        };
+        controller.update_control(request1).await.unwrap();
+
+        let state = controller.state.lock().await;
+        assert!(state.previous_solution.is_some());
+        drop(state);
+
+        controller.reset().await;
+
+        let state = controller.state.lock().await;
+        assert!(state.previous_solution.is_none());
+        assert_relative_eq!(state.last_power_change, 0.0, epsilon = 1e-10);
     }
 }

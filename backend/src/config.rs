@@ -29,6 +29,13 @@ pub struct MeaDiagnosticsConfig {
     pub min_confidence: f64,
     pub diagnosis_interval_secs: u64,
     pub max_concurrent_diagnoses: usize,
+    pub reference_temperature: f64,
+    pub temperature_coefficient_ohmic: f64,
+    pub temperature_coefficient_ct: f64,
+    pub temperature_coefficient_dlc: f64,
+    pub temperature_coefficient_warburg: f64,
+    pub min_temperature_compensation: f64,
+    pub max_temperature_compensation: f64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -43,6 +50,12 @@ pub struct LeakDetectionConfig {
     pub min_leak_rate: f64,
     pub detection_interval_secs: u64,
     pub max_concurrent_detections: usize,
+    pub adaptive_filter_order: usize,
+    pub adaptive_filter_mu: f64,
+    pub min_snr_threshold: f64,
+    pub noise_estimation_window: usize,
+    pub max_filter_gain: f64,
+    pub snr_based_weighting: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -57,6 +70,13 @@ pub struct RenewableCouplingConfig {
     pub control_interval_secs: u64,
     pub max_power_kw: f64,
     pub min_power_kw: f64,
+    pub mpc_max_iterations: u32,
+    pub mpc_solve_timeout_us: u64,
+    pub hot_start_enabled: bool,
+    pub approximate_solve_enabled: bool,
+    pub approximate_solve_threshold: f64,
+    pub power_change_threshold: f64,
+    pub warm_start_gain: f64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -71,6 +91,14 @@ pub struct DegradationPredictionConfig {
     pub efficiency_failure_threshold: f64,
     pub prediction_interval_secs: u64,
     pub max_concurrent_predictions: usize,
+    pub bayesian_prior_enabled: bool,
+    pub prior_mean_voltage_rate: f64,
+    pub prior_std_voltage_rate: f64,
+    pub transfer_learning_enabled: bool,
+    pub transfer_weight: f64,
+    pub min_transfer_samples: usize,
+    pub prior_strength: f64,
+    pub divergence_threshold: f64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -224,6 +252,13 @@ impl Default for AppConfig {
                 min_confidence: 0.7,
                 diagnosis_interval_secs: 300,
                 max_concurrent_diagnoses: 3,
+                reference_temperature: 60.0,
+                temperature_coefficient_ohmic: 0.002,
+                temperature_coefficient_ct: 0.003,
+                temperature_coefficient_dlc: -0.001,
+                temperature_coefficient_warburg: 0.0015,
+                min_temperature_compensation: 10.0,
+                max_temperature_compensation: 80.0,
             },
             leak_detection: LeakDetectionConfig {
                 ultrasound_frequency_min: 30000.0,
@@ -236,6 +271,12 @@ impl Default for AppConfig {
                 min_leak_rate: 0.001,
                 detection_interval_secs: 10,
                 max_concurrent_detections: 5,
+                adaptive_filter_order: 8,
+                adaptive_filter_mu: 0.01,
+                min_snr_threshold: 3.0,
+                noise_estimation_window: 100,
+                max_filter_gain: 10.0,
+                snr_based_weighting: true,
             },
             renewable_coupling: RenewableCouplingConfig {
                 mpc_horizon: 10,
@@ -248,6 +289,13 @@ impl Default for AppConfig {
                 control_interval_secs: 5,
                 max_power_kw: 100.0,
                 min_power_kw: 10.0,
+                mpc_max_iterations: 100,
+                mpc_solve_timeout_us: 1000,
+                hot_start_enabled: true,
+                approximate_solve_enabled: true,
+                approximate_solve_threshold: 0.1,
+                power_change_threshold: 20.0,
+                warm_start_gain: 0.8,
             },
             degradation_prediction: DegradationPredictionConfig {
                 gp_length_scale: 30.0,
@@ -260,6 +308,14 @@ impl Default for AppConfig {
                 efficiency_failure_threshold: 65.0,
                 prediction_interval_secs: 3600,
                 max_concurrent_predictions: 2,
+                bayesian_prior_enabled: true,
+                prior_mean_voltage_rate: 0.005,
+                prior_std_voltage_rate: 0.002,
+                transfer_learning_enabled: true,
+                transfer_weight: 0.3,
+                min_transfer_samples: 10,
+                prior_strength: 10.0,
+                divergence_threshold: 0.01,
             },
         }
     }
