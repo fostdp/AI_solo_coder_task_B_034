@@ -4,6 +4,7 @@ use tokio::sync::{mpsc, Semaphore};
 use tracing::{debug, info, warn};
 
 use crate::config::DegradationPredictionConfig;
+use crate::gp_inference_service::GPInferenceHandle;
 use crate::models::*;
 
 #[derive(Debug, Clone)]
@@ -17,6 +18,7 @@ pub struct DegradationPredictor {
     config: DegradationPredictionConfig,
     semaphore: Arc<Semaphore>,
     transfer_knowledge_base: Arc<std::sync::Mutex<Vec<TransferKnowledge>>>,
+    gp_inference_handle: GPInferenceHandle,
 }
 
 #[derive(Debug, Clone)]
@@ -47,10 +49,18 @@ impl DegradationPredictor {
         let semaphore = Arc::new(Semaphore::new(config.max_concurrent_predictions));
         let transfer_knowledge_base = Arc::new(std::sync::Mutex::new(Vec::new()));
 
+        let (gp_tx, gp_rx) = mpsc::channel::<crate::gp_inference_service::GPInferenceRequest>(100);
+        let gp_handle = GPInferenceHandle::new(gp_tx);
+        let gp_service = crate::gp_inference_service::GPInferenceService::new(config.clone(), gp_rx);
+        tokio::spawn(async move {
+            gp_service.run().await;
+        });
+
         let predictor = Self {
             config,
             semaphore,
             transfer_knowledge_base,
+            gp_inference_handle: gp_handle,
         };
 
         (predictor, rx)
@@ -92,12 +102,12 @@ impl DegradationPredictor {
             None
         };
 
-        let predictions = self.run_gaussian_process_regression(
-            &request.history_data,
-            &features,
-            bayesian_prior.as_ref(),
-            transfer_info.as_ref(),
-        )?;
+        let predictions = self.gp_inference_handle.infer(
+            request.history_data.clone(),
+            bayesian_prior.clone(),
+            transfer_info.clone(),
+        ).await
+        .map_err(|e| format!("GP inference service error: {}", e))?;
 
         let is_divergent = self.check_prediction_divergence(&predictions, &features);
         if is_divergent {
